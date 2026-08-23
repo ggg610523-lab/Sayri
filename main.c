@@ -1,5 +1,6 @@
 
 #include <SDL2/SDL.h>
+#include <SDL2/SDL_image.h>
 #include <SDL2/SDL_ttf.h>
 
 #include <stdio.h>
@@ -9,6 +10,7 @@
 #include <ctype.h>
 #include <stdlib.h>
 #include <dirent.h>
+#include <unistd.h>
 
 #include "ui.h"
 #include "hamburger.h"
@@ -897,6 +899,45 @@ int main(void)
 
     if (!window || !renderer)
         return 1;
+
+    /*
+        Window icon: sayri.png next to the
+        executable, so the path survives any
+        working directory.
+    */
+    {
+        char icon_path[512];
+
+        ssize_t ilen =
+            readlink(
+                "/proc/self/exe",
+                icon_path,
+                sizeof(icon_path) - 32);
+
+        if (ilen > 0) {
+            icon_path[ilen] = '\0';
+
+            char *slash =
+                strrchr(icon_path, '/');
+
+            if (slash)
+                slash[1] = '\0';
+
+            strcat(icon_path, "sayri.png");
+        } else {
+            snprintf(icon_path,
+                     sizeof(icon_path),
+                     "sayri.png");
+        }
+
+        SDL_Surface *icon =
+            IMG_Load(icon_path);
+
+        if (icon) {
+            SDL_SetWindowIcon(window, icon);
+            SDL_FreeSurface(icon);
+        }
+    }
 
     char *fontPath = find_font();
     if (!fontPath) {
