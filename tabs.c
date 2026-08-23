@@ -123,23 +123,6 @@ void tabs_draw(
         (targetW - tabs->indicatorW) *
         8.0f * dt;
 
-    /*
-        Snap when very close to avoid
-        sub-pixel jitter.
-    */
-
-    float dx =
-        targetX - tabs->indicatorX;
-
-    if (dx > -0.5f && dx < 0.5f)
-        tabs->indicatorX = targetX;
-
-    float dw =
-        targetW - tabs->indicatorW;
-
-    if (dw > -0.5f && dw < 0.5f)
-        tabs->indicatorW = targetW;
-
     SDL_Rect indicator = {
         (int)roundf(tabs->indicatorX),
         tabs->rect.y,
@@ -162,7 +145,7 @@ void tabs_draw(
         radius,
         ui_theme(ui->dark,
             (UIColor){255, 255, 255, 100},
-            (UIColor){70, 80, 110, 80})
+            (UIColor){38, 38, 42, 55})
     );
 
     for (int i = 0; i < tabs->count; i++) {

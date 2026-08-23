@@ -30,8 +30,7 @@ void hamburger_event(
 void hamburger_draw(
     UIHamburger *hb,
     UIContext *ui,
-    SDL_Renderer *renderer,
-    float dt
+    SDL_Renderer *renderer
 );
 
 #endif /* HAMBURGER_H */

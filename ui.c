@@ -213,31 +213,34 @@ void ui_fill_rounded_rect_gradient(
 
         SDL_RenderDrawLine(
             renderer,
-            left + 1,
-            rect.y + y,
-            right - 1,
-            rect.y + y
-        );
-
-        SDL_SetRenderDrawColor(
-            renderer,
-            c.r,
-            c.g,
-            c.b,
-            edge_a
-        );
-
-        SDL_RenderDrawPoint(
-            renderer,
             left,
-            rect.y + y
-        );
-
-        SDL_RenderDrawPoint(
-            renderer,
+            rect.y + y,
             right,
             rect.y + y
         );
+
+        if (frac > 0.01f) {
+
+            SDL_SetRenderDrawColor(
+                renderer,
+                c.r,
+                c.g,
+                c.b,
+                edge_a
+            );
+
+            SDL_RenderDrawPoint(
+                renderer,
+                left,
+                rect.y + y
+            );
+
+            SDL_RenderDrawPoint(
+                renderer,
+                right,
+                rect.y + y
+            );
+        }
     }
 }
 
@@ -411,31 +414,34 @@ void ui_fill_rounded_rect(
 
             SDL_RenderDrawLine(
                 renderer,
-                left + 1,
-                rect.y + y,
-                right - 1,
-                rect.y + y
-            );
-
-            SDL_SetRenderDrawColor(
-                renderer,
-                color.r,
-                color.g,
-                color.b,
-                edge_a
-            );
-
-            SDL_RenderDrawPoint(
-                renderer,
                 left,
-                rect.y + y
-            );
-
-            SDL_RenderDrawPoint(
-                renderer,
+                rect.y + y,
                 right,
                 rect.y + y
             );
+
+            if (frac > 0.01f) {
+
+                SDL_SetRenderDrawColor(
+                    renderer,
+                    color.r,
+                    color.g,
+                    color.b,
+                    edge_a
+                );
+
+                SDL_RenderDrawPoint(
+                    renderer,
+                    left,
+                    rect.y + y
+                );
+
+                SDL_RenderDrawPoint(
+                    renderer,
+                    right,
+                    rect.y + y
+                );
+            }
         }
     }
 }
@@ -858,8 +864,8 @@ void ui_glass(
     if (dark) {
 
         material = active
-            ? (UIColor){45, 50, 68, 210}
-            : (UIColor){30, 35, 50, 175};
+            ? (UIColor){42, 42, 45, 210}
+            : (UIColor){28, 28, 30, 175};
 
     } else {
 
@@ -885,11 +891,11 @@ void ui_glass(
         radius,
         ui_theme(dark,
             active
-            ? (UIColor){255, 255, 255, 60}
-            : (UIColor){255, 255, 255, 40},
+            ? (UIColor){255, 255, 255, 150}
+            : (UIColor){255, 255, 255, 105},
             active
-            ? (UIColor){100, 115, 150, 60}
-            : (UIColor){80, 90, 120, 40})
+            ? (UIColor){50, 50, 55, 80}
+            : (UIColor){38, 38, 42, 55})
     );
 }
 
@@ -898,10 +904,19 @@ void ui_glass(
    Text cache
    ============================================================ */
 
-#define TEXT_CACHE_SIZE 64
+#define TEXT_CACHE_SIZE 256
+
+/*
+    Cached strings are OWNED COPIES. Callers
+    frequently pass transient buffers (wrapped
+    chat lines, formatted values) whose lifetimes
+    end right after the call — storing pointers
+    would alias later draws.
+*/
+#define UI_TEXT_CACHE_STR 1024
 
 typedef struct {
-    const char *text;
+    char text[UI_TEXT_CACHE_STR];
     TTF_Font *font;
     SDL_Color color;
     SDL_Texture *texture;
@@ -963,7 +978,7 @@ static TextCacheEntry *text_cache_evict(void)
         SDL_DestroyTexture(e->texture);
 
     e->texture = NULL;
-    e->text = NULL;
+    e->text[0] = '\0';
 
     return e;
 }
@@ -1002,7 +1017,13 @@ static TextCacheEntry *text_cache_insert(
         return NULL;
     }
 
-    entry->text = text;
+    /*
+        Own the string.
+    */
+    snprintf(entry->text,
+             sizeof(entry->text),
+             "%s", text);
+
     entry->font = font;
     entry->color = color;
     entry->w = surface->w;
@@ -1024,7 +1045,7 @@ void ui_text_cache_clear(void)
             text_cache[i].texture = NULL;
         }
 
-        text_cache[i].text = NULL;
+        text_cache[i].text[0] = '\0';
     }
 
     text_cache_count = 0;

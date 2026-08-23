@@ -97,10 +97,7 @@ void notif_draw(
     int startX =
         ui->window_w - notifW - padX;
 
-    int menuBarH =
-        (int)roundf(55.0f * ui->scale);
-
-    int startY = menuBarH + padX;
+    int startY = padX;
 
     for (int i = 0; i < NOTIF_MAX; i++) {
 

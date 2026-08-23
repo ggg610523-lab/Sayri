@@ -1,5 +1,4 @@
 #include "radio.h"
-#include <math.h>
 
 void radio_init(
     UIRadio *radio,
@@ -8,8 +7,6 @@ void radio_init(
 {
     radio->text = text;
     radio->selected = selected;
-    radio->select_anim =
-        selected ? 1.0f : 0.0f;
 }
 
 void radio_layout(
@@ -47,7 +44,7 @@ bool radio_event(
             )
         ) {
 
-            radio->selected = true;
+            radio->selected = !radio->selected;
 
             return true;
         }
@@ -60,25 +57,8 @@ void radio_draw(
     UIRadio *radio,
     UIContext *ui,
     SDL_Renderer *renderer,
-    TTF_Font *font,
-    float dt)
+    TTF_Font *font)
 {
-    float target =
-        radio->selected ? 1.0f : 0.0f;
-
-    radio->select_anim +=
-        (target - radio->select_anim) *
-        12.0f * dt;
-
-    if (radio->select_anim < 0.001f)
-        radio->select_anim = 0.0f;
-
-    if (radio->select_anim > 0.999f)
-        radio->select_anim = 1.0f;
-
-    float t = ui_ease_out_cubic(
-        radio->select_anim);
-
     int outerRadius =
         (int)roundf(
             10.0f * ui->scale);
@@ -96,9 +76,7 @@ void radio_draw(
         renderer,
         cx, cy + 2,
         outerRadius + 1,
-        ui_theme(ui->dark,
-            (UIColor){15, 20, 40, 20},
-            (UIColor){0, 0, 0, 40}));
+        (UIColor){15, 20, 40, 20});
 
     /*
         Outer glass circle.
@@ -107,9 +85,7 @@ void radio_draw(
         renderer,
         cx, cy,
         outerRadius,
-        ui_theme(ui->dark,
-            (UIColor){240, 245, 252, 195},
-            (UIColor){40, 48, 68, 195}));
+        (UIColor){240, 245, 252, 195});
 
     /*
         Bright ring.
@@ -118,9 +94,7 @@ void radio_draw(
         renderer,
         cx, cy,
         outerRadius - 1,
-        ui_theme(ui->dark,
-            (UIColor){255, 255, 255, 110},
-            (UIColor){70, 80, 110, 80}));
+        (UIColor){255, 255, 255, 110});
 
     /*
         Top highlight arc (simulated).
@@ -136,8 +110,7 @@ void radio_draw(
 
         SDL_SetRenderDrawColor(
             renderer,
-            255, 255, 255,
-            ui->dark ? 20 : 40);
+            255, 255, 255, 40);
 
         for (int y = -hlR; y <= 0; ++y) {
 
@@ -158,52 +131,38 @@ void radio_draw(
     }
 
     /*
-        Selected indicator (animated).
+        Selected indicator.
     */
-    if (t > 0.01f) {
+    if (radio->selected) {
 
         int innerRadius =
             (int)roundf(
-                5.0f * ui->scale * t);
-
-        if (innerRadius < 1)
-            innerRadius = 1;
+                5.0f * ui->scale);
 
         /* Glow */
-        Uint8 glow_a =
-            (Uint8)(40 * t);
-
         ui_fill_circle(
             renderer,
             cx, cy,
             innerRadius + 3,
             (UIColor){
-                55, 110, 240, glow_a});
+                55, 110, 240, 40});
 
         /* Core */
-        Uint8 core_a =
-            (Uint8)(255 * t);
-
         ui_fill_circle(
             renderer,
             cx, cy,
             innerRadius,
             (UIColor){
-                50, 100, 235, core_a});
+                50, 100, 235, 255});
 
         /* Bright center */
-        if (innerRadius > 2) {
-
-            Uint8 hi_a =
-                (Uint8)(180 * t);
-
-            ui_fill_circle(
-                renderer,
-                cx, cy,
-                innerRadius - 2,
-                (UIColor){
-                    100, 150, 255, hi_a});
-        }
+        ui_fill_circle(
+            renderer,
+            cx, cy,
+            innerRadius > 2
+                ? innerRadius - 2 : 1,
+            (UIColor){
+                100, 150, 255, 180});
     }
 
     ui_text(

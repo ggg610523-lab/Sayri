@@ -11,14 +11,41 @@
 #include "ui.h"
 #include "hamburger.h"
 #include "sidebar.h"
+#include "orb.h"
+#include "toggle.h"
+#include "popup.h"
+#include "downloads.h"
+#include "ollama.h"
+#include "history.h"
+#include <time.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
 #define MAX_MESSAGES 32
-#define MSG_MAX 512
+#define MSG_MAX 2048
 #define INPUT_MAX 256
+
+#define OLLAMA_MODEL "llama3.2"
+#define OLLAMA_HISTORY 10
+#define MAX_MODELS 16
+
+static char g_current_model[128] = OLLAMA_MODEL;
+static char g_models[MAX_MODELS][128];
+static int g_model_count = 0;
+static int g_model_idx = 0;
+static char g_model_label[160];
+
+static HistoryList g_history;
+static char g_item_labels[HISTORY_MAX_FILES][32];
+
+/*
+    False once /api proves unreachable —
+    the Downloads panel then offers full
+    bootstrap.
+*/
+static bool g_server_ok = true;
 
 static UIColor lerp_color(
     UIColor a, UIColor b, float t)
@@ -52,7 +79,8 @@ typedef struct {
     float target_scroll;
 
     bool is_thinking;
-    float thinking_timer;
+
+    char cur_session[64];
 } AppState;
 
 static char *find_font(void)
@@ -89,8 +117,8 @@ static void add_message(
     ChatMessage *m =
         &state->messages[state->count];
 
-    strncpy(m->text, text, MSG_MAX - 1);
-    m->text[MSG_MAX - 1] = '\0';
+    snprintf(m->text, sizeof(m->text),
+             "%s", text);
     m->is_user = is_user;
     m->alpha = 0.0f;
     m->slide_y = 16.0f;
@@ -98,29 +126,234 @@ static void add_message(
     state->count++;
 }
 
-static void simulate_response(AppState *state)
+static void refresh_model_label(void)
 {
-    const char *responses[] = {
-        "I can help you with that.",
-        "Let me look into this for you.",
-        "That's a great question.",
-        "Here's what I found.",
-        "I understand. One moment.",
-        "Sure, I'll take care of that.",
-    };
+    snprintf(g_model_label,
+             sizeof(g_model_label),
+             "Model: %s", g_current_model);
+}
 
-    int n = (int)(sizeof(responses) /
-                  sizeof(responses[0]));
+static void persist_session(
+    AppState *st)
+{
+    if (st->count == 0)
+        return;
 
-    int idx =
-        (int)((float)n *
-              fmodf(
-                  (float)SDL_GetTicks() /
-                  4000.0f, 1.0f));
+    /*
+        Don't persist a bare welcome screen.
+    */
+    if (st->count == 1 &&
+        !st->messages[0].is_user)
+        return;
 
-    if (idx >= n) idx = n - 1;
+    const char *roles[MAX_MESSAGES];
+    const char *texts[MAX_MESSAGES];
 
-    add_message(state, responses[idx], false);
+    for (int i = 0; i < st->count; i++) {
+        roles[i] =
+            st->messages[i].is_user
+            ? "user" : "assistant";
+        texts[i] = st->messages[i].text;
+    }
+
+    history_save(st->cur_session,
+                 st->cur_session,
+                 sizeof(st->cur_session),
+                 roles, texts, st->count);
+}
+
+static void send_user_message(
+    AppState *state,
+    const char *text)
+{
+    add_message(state, text, true);
+
+    /*
+        Build conversation history for context.
+    */
+    const char *roles[OLLAMA_HISTORY];
+    const char *contents[OLLAMA_HISTORY];
+
+    int start = state->count - OLLAMA_HISTORY;
+
+    if (start < 0) start = 0;
+
+    int n = 0;
+
+    for (int i = start; i < state->count; i++) {
+
+        /*
+            Skip synthetic assistant notes such
+            as "(Cannot reach Ollama ...)" —
+            they aren't real replies.
+        */
+        if (!state->messages[i].is_user &&
+            state->messages[i].text[0] == '(')
+            continue;
+
+        roles[n] =
+            state->messages[i].is_user
+            ? "user" : "assistant";
+        contents[n] = state->messages[i].text;
+        n++;
+    }
+
+    if (n == 0) {
+        /*
+            Nothing but synthetic notes: send
+            the user's text alone.
+        */
+        roles[0] = "user";
+        contents[0] = text;
+        n = 1;
+    }
+
+    char *body = ollama_build_body(
+        g_current_model, roles, contents, n);
+
+    if (!body) {
+        add_message(state,
+            "(Out of memory.)", false);
+        return;
+    }
+
+    if (ollama_begin(body)) {
+        state->is_thinking = true;
+
+    } else {
+        free(body);
+        add_message(state,
+            "(Still answering the previous "
+            "message\u2026)", false);
+    }
+}
+
+static int sidebar_item_at(
+    UISidebar *sb,
+    UIContext *ui,
+    int mx,
+    int my)
+{
+    if (!sb->open || sb->anim < 0.85f)
+        return -1;
+
+    for (int i = 0; i < SIDEBAR_ITEMS; i++) {
+
+        SDL_Rect row =
+            ui_rect(
+                ui,
+                SIDEBAR_ITEM_X,
+                SIDEBAR_ITEM_Y +
+                    i * SIDEBAR_ITEM_GAP,
+                SIDEBAR_ITEM_W,
+                SIDEBAR_ITEM_H
+            );
+
+        if (ui_point_in_rect(mx, my, row))
+            return i;
+    }
+
+    return -1;
+}
+
+#define CHAT_WRAP_LINES 24
+#define CHAT_LINE_CAP 512
+
+/*
+    Word-wrap text into lines that fit max_w.
+    Honors explicit newlines. Returns line count;
+    output is truncated at max_lines with an
+    ellipsis.
+*/
+static int wrap_lines(
+    TTF_Font *font,
+    const char *text,
+    int max_w,
+    char out[][CHAT_LINE_CAP],
+    int max_lines)
+{
+    int count = 0;
+
+    out[0][0] = '\0';
+
+    const char *p = text;
+
+    while (*p) {
+
+        /*
+            One paragraph per explicit newline.
+        */
+        const char *nl = strchr(p, '\n');
+
+        size_t seg_len =
+            nl ? (size_t)(nl - p)
+               : strlen(p);
+
+        char seg[CHAT_LINE_CAP];
+
+        snprintf(seg, sizeof(seg),
+                 "%.*s", (int)seg_len, p);
+
+        char *save = NULL;
+
+        for (char *word =
+                strtok_r(seg, " ", &save);
+             word;
+             word = strtok_r(NULL, " ", &save)) {
+
+            char candidate[CHAT_LINE_CAP];
+            int cur_len =
+                (int)strlen(out[count]);
+
+            snprintf(candidate,
+                     sizeof(candidate),
+                     "%s%s%s",
+                     out[count],
+                     cur_len ? " " : "",
+                     word);
+
+            int w = 0;
+            TTF_SizeUTF8(font, candidate,
+                         &w, NULL);
+
+            if (cur_len == 0 || w <= max_w) {
+                snprintf(out[count],
+                         sizeof(out[count]),
+                         "%s", candidate);
+
+            } else {
+
+                if (count + 1 >= max_lines) {
+                    size_t len =
+                        strlen(out[count]);
+                    snprintf(
+                        out[count] + len,
+                        sizeof(out[count]) - len,
+                        "\u2026");
+                    return count + 1;
+                }
+
+                count++;
+                snprintf(out[count],
+                         sizeof(out[count]),
+                         "%s", word);
+            }
+        }
+
+        if (!nl)
+            break;
+
+        p = nl + 1;
+
+        if (*p && count + 1 < max_lines) {
+            count++;
+            out[count][0] = '\0';
+        } else if (!*p) {
+            break;
+        }
+    }
+
+    return count + 1;
 }
 
 static void draw_chat_area(
@@ -135,7 +368,9 @@ static void draw_chat_area(
     ui_fill_rounded_rect(
         renderer, container,
         (int)roundf(18.0f * ui->scale),
-        (UIColor){240, 245, 252, 175});
+        ui->dark
+        ? (UIColor){26, 26, 29, 190}
+        : (UIColor){240, 245, 252, 175});
 
     SDL_RenderSetClipRect(renderer, &container);
 
@@ -175,7 +410,32 @@ static void draw_chat_area(
             ? x + w - pad - bubbleW
             : x + pad;
 
-        curY -= msgH + msgGap;
+        /*
+            Wrap into lines that fit the bubble.
+        */
+        char lines[CHAT_WRAP_LINES][CHAT_LINE_CAP];
+
+        int lineCount =
+            wrap_lines(
+                font, m->text,
+                bubbleW - textPad * 2,
+                lines, CHAT_WRAP_LINES);
+
+        int fontH = TTF_FontHeight(font);
+
+        int lineH = fontH +
+            (int)roundf(3.0f * ui->scale);
+
+        int padV =
+            (int)roundf(9.0f * ui->scale);
+
+        int bubbleH =
+            lineCount * lineH + padV * 2;
+
+        if (bubbleH < msgH)
+            bubbleH = msgH;
+
+        curY -= bubbleH + msgGap;
         int bubbleY =
             curY + (int)(m->slide_y * (1.0f - m->alpha));
 
@@ -183,32 +443,46 @@ static void draw_chat_area(
             (Uint8)(180.0f * m->alpha);
 
         SDL_Rect bubble = {
-            bubbleX, bubbleY, bubbleW, msgH};
+            bubbleX, bubbleY, bubbleW, bubbleH};
 
         if (m->is_user) {
             ui_fill_rounded_rect(
                 renderer, bubble,
                 (int)roundf(14.0f * ui->scale),
-                (UIColor){200, 210, 240, bgA});
+                ui->dark
+                ? (UIColor){62, 62, 70, bgA}
+                : (UIColor){200, 210, 240, bgA});
         } else {
             ui_fill_rounded_rect(
                 renderer, bubble,
                 (int)roundf(14.0f * ui->scale),
-                (UIColor){230, 235, 248, bgA});
+                ui->dark
+                ? (UIColor){44, 44, 49, bgA}
+                : (UIColor){230, 235, 248, bgA});
         }
 
         Uint8 tA =
             (Uint8)(230.0f * m->alpha);
 
-        ui_text(
-            renderer, font, m->text,
-            bubbleX + textPad,
-            bubbleY +
-                (msgH - (int)roundf(
-                    17.0f * ui->scale)) / 2,
+        int textY = bubbleY +
+            (bubbleH - lineCount * lineH) / 2;
+
+        UIColor textColor =
             m->is_user
-            ? (UIColor){35, 45, 80, tA}
-            : (UIColor){50, 55, 85, tA});
+            ? ui_theme(ui->dark,
+                  (UIColor){35, 45, 80, tA},
+                  (UIColor){225, 232, 250, tA})
+            : ui_theme(ui->dark,
+                  (UIColor){50, 55, 85, tA},
+                  (UIColor){208, 216, 236, tA});
+
+        for (int k = 0; k < lineCount; k++) {
+            ui_text(
+                renderer, font, lines[k],
+                bubbleX + textPad,
+                textY + k * lineH,
+                textColor);
+        }
     }
 
     SDL_RenderSetClipRect(renderer, NULL);
@@ -228,8 +502,12 @@ static void draw_input_bar(
         renderer, bar,
         (int)roundf(14.0f * ui->scale),
         state->input_focused
-        ? (UIColor){246, 250, 255, 205}
-        : (UIColor){240, 245, 252, 175});
+        ? ui_theme(ui->dark,
+              (UIColor){246, 250, 255, 205},
+              (UIColor){40, 40, 45, 215})
+        : ui_theme(ui->dark,
+              (UIColor){240, 245, 252, 175},
+              (UIColor){24, 24, 27, 185}));
 
     int pad =
         (int)roundf(14.0f * ui->scale);
@@ -240,7 +518,9 @@ static void draw_input_bar(
             x + pad,
             y + (h - (int)roundf(
                 17.0f * ui->scale)) / 2,
-            (UIColor){30, 35, 60, 255});
+            ui_theme(ui->dark,
+                (UIColor){30, 35, 60, 255},
+                (UIColor){220, 228, 245, 255}));
     } else {
         ui_text(
             renderer, font,
@@ -248,7 +528,9 @@ static void draw_input_bar(
             x + pad,
             y + (h - (int)roundf(
                 17.0f * ui->scale)) / 2,
-            (UIColor){140, 145, 170, 180});
+            ui_theme(ui->dark,
+                (UIColor){140, 145, 170, 180},
+                (UIColor){125, 133, 158, 180}));
     }
 
     if (state->input_focused) {
@@ -301,6 +583,7 @@ static void draw_input_bar(
 static void draw_send_button(
     SDL_Renderer *renderer,
     AppState *state,
+    UIContext *ui,
     TTF_Font *font,
     int x, int y, int size)
 {
@@ -322,7 +605,9 @@ static void draw_send_button(
         ui_fill_circle(
             renderer,
             x + size / 2, y + size / 2, r,
-            (UIColor){200, 205, 220, 150});
+            ui_theme(ui->dark,
+                (UIColor){200, 205, 220, 150},
+                (UIColor){70, 78, 98, 170}));
     }
 
     const char *arrow = "\u2191";
@@ -337,22 +622,35 @@ static void draw_send_button(
                   has ? 255 : 100});
 }
 
+
 static void draw_background(
     SDL_Renderer *renderer,
+    UIContext *ui,
     int width, int height, float time)
 {
+    bool dark = ui->dark;
+
     for (int y = 0; y < height; ++y) {
         float t =
             (float)y / (float)(height - 1);
-        Uint8 r = (Uint8)(205 + t * 25.0f);
-        Uint8 g = (Uint8)(215 + t * 18.0f);
-        Uint8 b = (Uint8)(242 - t * 5.0f);
+
+        Uint8 r = dark
+            ? (Uint8)(16 + t * 10.0f)
+            : (Uint8)(205 + t * 25.0f);
+        Uint8 g = dark
+            ? (Uint8)(18 + t * 10.0f)
+            : (Uint8)(215 + t * 18.0f);
+        Uint8 b = dark
+            ? (Uint8)(28 + t * 12.0f)
+            : (Uint8)(242 - t * 5.0f);
 
         SDL_SetRenderDrawColor(
             renderer, r, g, b, 255);
         SDL_RenderDrawLine(
             renderer, 0, y, width - 1, y);
     }
+
+    float orbA = dark ? 0.45f : 1.0f;
 
     float t1 = time * 0.15f;
     float t2 = time * 0.12f + 2.0f;
@@ -363,7 +661,8 @@ static void draw_background(
         (int)(width * 0.55f + sinf(t1) * 60.0f),
         (int)(height * 0.25f + cosf(t1 * 0.7f) * 40.0f),
         (int)(width * 0.28f),
-        (UIColor){110, 140, 235, 90},
+        (UIColor){110, 140, 235,
+                  (Uint8)(90 * orbA)},
         (UIColor){110, 140, 235, 0});
 
     ui_fill_radial_gradient(
@@ -371,7 +670,8 @@ static void draw_background(
         (int)(width * 0.72f + cosf(t2) * 50.0f),
         (int)(height * 0.70f + sinf(t2 * 0.8f) * 35.0f),
         (int)(width * 0.22f),
-        (UIColor){230, 130, 195, 80},
+        (UIColor){230, 130, 195,
+                  (Uint8)(80 * orbA)},
         (UIColor){230, 130, 195, 0});
 
     ui_fill_radial_gradient(
@@ -379,7 +679,8 @@ static void draw_background(
         (int)(width * 0.38f + sinf(t3 * 0.6f) * 45.0f),
         (int)(height * 0.60f + cosf(t3) * 30.0f),
         (int)(width * 0.18f),
-        (UIColor){100, 200, 185, 70},
+        (UIColor){100, 200, 185,
+                  (Uint8)(70 * orbA)},
         (UIColor){100, 200, 185, 0});
 
     ui_fill_radial_gradient(
@@ -387,7 +688,8 @@ static void draw_background(
         (int)(width * 0.85f + sinf(t1 * 0.9f) * 35.0f),
         (int)(height * 0.15f + cosf(t2 * 0.5f) * 25.0f),
         (int)(width * 0.15f),
-        (UIColor){170, 140, 220, 55},
+        (UIColor){170, 140, 220,
+                  (Uint8)(55 * orbA)},
         (UIColor){170, 140, 220, 0});
 }
 
@@ -433,18 +735,22 @@ int main(void)
         return 1;
     }
 
+    /*
+        All text uses one typeface. Hierarchy
+        comes from size and color only —
+        synthetic bold distorts glyph shapes
+        enough to look like a different font.
+    */
     TTF_Font *font =
         TTF_OpenFont(fontPath, 13);
     TTF_Font *titleFont =
-        TTF_OpenFont(fontPath, 11);
+        TTF_OpenFont(fontPath, 15);
     TTF_Font *smallFont =
         TTF_OpenFont(fontPath, 10);
     TTF_Font *boldFont =
-        TTF_OpenFont(fontPath, 14);
-
-    if (boldFont)
-        TTF_SetFontStyle(
-            boldFont, TTF_STYLE_BOLD);
+        TTF_OpenFont(fontPath, 15);
+    TTF_Font *menuFont =
+        TTF_OpenFont(fontPath, 16);
 
     free(fontPath);
 
@@ -469,6 +775,37 @@ int main(void)
     UISidebar sidebar;
     sidebar_init(&sidebar);
 
+    /*
+        Sayri-specific menu labels.
+    */
+    sidebar.items[0] = "New Chat";
+    sidebar.items[1] = "Recents";
+    sidebar.items[2] = "Search";
+    sidebar.items[3] = "Downloads";
+    sidebar.items[4] = "Settings";
+
+    Orb orb;
+    orb_init(&orb, renderer);
+
+    ollama_init(OLLAMA_MODEL);
+
+    UIToggle darkToggle;
+    toggle_init(&darkToggle, false);
+
+    UIPopup settings;
+    popup_init(&settings, "Settings");
+    popup_set_row_label(&settings, "Dark Mode");
+    popup_link_toggle(&settings, &darkToggle);
+
+    UIPopup recentsPopup;
+    popup_init(&recentsPopup, "Recents");
+
+    UIDownloads dlPanel;
+    downloads_init(&dlPanel, "llama3.2");
+
+    ollama_init(g_current_model);
+    refresh_model_label();
+
     SDL_Texture *rt = NULL;
     int rt_w = 0;
     int rt_h = 0;
@@ -480,6 +817,10 @@ int main(void)
         SDL_GetPerformanceCounter();
     float prev_time =
         (float)((double)start / (double)perf_freq);
+
+    float orb_grow = 0.0f;
+    float orb_dt = 0.0f;
+    int frame_count = 0;
 
     while (running) {
 
@@ -510,13 +851,15 @@ int main(void)
 
                 if (event.key.keysym.sym ==
                     SDLK_RETURN &&
-                    state.input_len > 0) {
-                    add_message(&state,
-                        state.input, true);
+                    state.input_len > 0 &&
+                    !state.is_thinking) {
+                    char msg[INPUT_MAX];
+                    snprintf(msg, sizeof(msg),
+                             "%s", state.input);
                     state.input[0] = '\0';
                     state.input_len = 0;
-                    state.is_thinking = true;
-                    state.thinking_timer = 1.0f;
+                    send_user_message(
+                        &state, msg);
                 }
             }
 
@@ -531,11 +874,227 @@ int main(void)
                 }
             }
 
+            /*
+                Popups must see mouse events BEFORE
+                anything else reacts to them, so a
+                fresh "open" isn't dismissed by the
+                very same click.
+            */
+            popup_event(&settings, &ui, &event);
+            popup_event(&recentsPopup, &ui, &event);
+            downloads_event(&dlPanel, &ui, &event);
+
             if (event.type ==
                 SDL_MOUSEBUTTONDOWN &&
                 event.button.button ==
                 SDL_BUTTON_LEFT)
             {
+                int item =
+                    sidebar_item_at(
+                        &sidebar, &ui,
+                        event.button.x,
+                        event.button.y);
+
+                if (item >= 0) {
+                    switch (item) {
+                    case 0:
+                        /*
+                            New Chat: save current
+                            session, start fresh.
+                        */
+                        persist_session(&state);
+                        state.count = 0;
+                        state.cur_session[0] =
+                            '\0';
+                        state.input[0] = '\0';
+                        state.input_len = 0;
+                        add_message(&state,
+                            "Hi, I'm Sayri. "
+                            "How can I help?",
+                            false);
+                        break;
+
+                    case 1: {
+                        /*
+                            Recents.
+                        */
+                        settings.open = false;
+
+                        g_history.count = 0;
+                        history_list(&g_history);
+
+                        if (g_history.count >
+                            POPUP_MAX_ITEMS)
+                            g_history.count =
+                                POPUP_MAX_ITEMS;
+
+                        if (g_history.count == 0)
+                            snprintf(
+                                g_item_labels[0],
+                                sizeof(g_item_labels[0]),
+                                "(no saved chats)");
+
+                        for (int k = 0;
+                             k < g_history.count;
+                             k++) {
+
+                            long t = atol(
+                                g_history.names[k]);
+
+                            struct tm *tm =
+                                localtime(&t);
+
+                            strftime(
+                                g_item_labels[k],
+                                sizeof(g_item_labels[0]),
+                                "%b %d %H:%M", tm);
+                        }
+
+                        const char *labels[
+                            POPUP_MAX_ITEMS];
+
+                        int label_count =
+                            g_history.count;
+
+                        if (label_count == 0)
+                            label_count = 1;
+
+                        for (int k = 0;
+                             k < label_count;
+                             k++)
+                            labels[k] =
+                                g_item_labels[k];
+
+                        popup_set_items(
+                            &recentsPopup,
+                            labels,
+                            label_count);
+
+                        recentsPopup.open = true;
+                        break;
+                    }
+
+                    case 2:
+                        recentsPopup.open = false;
+                        persist_session(&state);
+                        add_message(&state,
+                            "Search coming soon.",
+                            false);
+                        break;
+
+                    case 3: {
+                        /*
+                            Downloads panel.
+                        */
+                        if (settings.clicked_outside ||
+                            recentsPopup.clicked_outside)
+                            break;
+
+                        settings.open = false;
+                        recentsPopup.open = false;
+
+                        bool was_open =
+                            dlPanel.open;
+
+                        dlPanel.open = !was_open;
+
+                        if (dlPanel.open &&
+                            !dlPanel.pulling) {
+
+                            /*
+                                Refresh installed
+                                state from the server.
+                            */
+                            char models_check[
+                                MAX_MODELS][128];
+
+                            int n =
+                                ollama_fetch_models(
+                                    models_check,
+                                    MAX_MODELS);
+
+                            g_server_ok =
+                                (n >= 0);
+
+                            bool found = false;
+
+                            size_t ml =
+                                strlen(dlPanel.model);
+
+                            for (int k = 0; k < n;
+                                 k++) {
+
+                                if (!strncmp(
+                                        models_check[k],
+                                        dlPanel.model,
+                                        ml) &&
+                                    (models_check[k][ml]
+                                        == ':' ||
+                                     models_check[k][ml]
+                                        == '\0')) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+
+                            if (g_server_ok)
+                                downloads_set_installed(
+                                    &dlPanel, found);
+                        }
+
+                        sidebar.open = false;
+                        break;
+                    }
+
+                    case 4:
+                        /*
+                            If this same click just
+                            dismissed the popup, don't
+                            reopen it.
+                        */
+                        if (!settings.clicked_outside) {
+                            popup_toggle(&settings);
+
+                            if (settings.open) {
+                                recentsPopup.open =
+                                    false;
+
+                                g_model_count =
+                                    ollama_fetch_models(
+                                        g_models,
+                                        MAX_MODELS);
+
+                                /*
+                                    Point the cycle at
+                                    the active model.
+                                */
+                                g_model_idx = 0;
+
+                                for (int k = 0;
+                                     k < g_model_count;
+                                     k++) {
+
+                                    if (!strcmp(
+                                            g_models[k],
+                                            g_current_model)) {
+                                        g_model_idx = k;
+                                        break;
+                                    }
+                                }
+
+                                refresh_model_label();
+                                popup_set_value(
+                                    &settings,
+                                    g_model_label);
+                            }
+                        }
+
+                        sidebar.open = false;
+                        break;
+                    }
+
+                }
+
                 int ibH =
                     (int)roundf(42.0f * ui.scale);
                 int pad2 =
@@ -544,6 +1103,35 @@ int main(void)
                     (int)roundf(
                         240.0f * ui.scale *
                         sidebar.anim);
+                int sendSize = ibH;
+                SDL_Rect sendBtn = {
+                    width - pad2 - sendSize,
+                    height - pad2 - ibH,
+                    sendSize,
+                    sendSize};
+
+                /*
+                    Send button.
+                */
+                if (ui_point_in_rect(
+                        event.button.x,
+                        event.button.y,
+                        sendBtn)) {
+
+                    if (state.input_len > 0 &&
+                        !state.is_thinking) {
+                        char msg[INPUT_MAX];
+                        snprintf(msg, sizeof(msg),
+                                 "%s",
+                                 state.input);
+                        state.input[0] = '\0';
+                        state.input_len = 0;
+                        state.input_focused =
+                            true;
+                        send_user_message(
+                            &state, msg);
+                    }
+                }
 
                 SDL_Rect ib = {
                     sbW + pad2,
@@ -569,45 +1157,147 @@ int main(void)
             sidebar_event(&sidebar, &event);
         }
 
+        /*
+            Theme follows the settings toggle.
+        */
+        ui.dark = darkToggle.on;
+
+        /*
+            Consume popup clicks.
+        */
+        int picked =
+            popup_consume_item_click(
+                &recentsPopup);
+
+        if (picked >= 0 &&
+            picked < g_history.count) {
+
+            char (*texts)[HISTORY_TEXT_MAX] =
+                malloc(
+                    sizeof(char[MAX_MESSAGES]
+                                  [HISTORY_TEXT_MAX]));
+
+            if (texts) {
+
+                unsigned char flags[
+                    MAX_MESSAGES];
+
+                int n = history_load(
+                    g_history.names[picked],
+                    texts, flags, MAX_MESSAGES);
+
+                state.count = 0;
+                state.cur_session[0] = '\0';
+
+                for (int i = 0; i < n; i++)
+                    add_message(&state,
+                        texts[i],
+                        flags[i] != 0);
+
+                snprintf(state.cur_session,
+                         sizeof(state.cur_session),
+                         "%s",
+                         g_history.names[picked]);
+
+                free(texts);
+            }
+
+            recentsPopup.open = false;
+        }
+
+        if (popup_consume_value_click(
+                &settings)) {
+
+            if (g_model_count > 0) {
+
+                g_model_idx =
+                    (g_model_idx + 1) %
+                    g_model_count;
+
+                snprintf(g_current_model,
+                         sizeof(g_current_model),
+                         "%s", g_models[g_model_idx]);
+
+                ollama_set_model(g_current_model);
+                refresh_model_label();
+            }
+        }
+
+        /*
+            Downloads panel: feed progress and
+            start pulls / full setup.
+        */
+        OllamaPull pull;
+
+        ollama_poll_pull(&pull);
+
+        downloads_set_pull(&dlPanel, &pull);
+
+        OllamaSetup setup;
+
+        ollama_poll_setup(&setup);
+
+        downloads_set_setup(&dlPanel, &setup,
+                            !g_server_ok);
+
+        if (setup.done && setup.ok) {
+
+            /*
+                Bootstrap finished: refresh the
+                model list so Settings can cycle
+                immediately.
+            */
+            g_model_count =
+                ollama_fetch_models(
+                    g_models, MAX_MODELS);
+
+            g_server_ok =
+                (g_model_count >= 0);
+
+            g_model_idx = 0;
+
+            for (int k = 0; k < g_model_count;
+                 k++) {
+
+                if (!strcmp(g_models[k],
+                            g_current_model)) {
+                    g_model_idx = k;
+                    break;
+                }
+            }
+
+            refresh_model_label();
+        }
+
+        if (downloads_consume_install_click(
+                &dlPanel)) {
+
+            bool busy =
+                dlPanel.pulling ||
+                dlPanel.setting_up;
+
+            if (!busy) {
+
+                if (!g_server_ok) {
+                    g_server_ok = true; /*
+                        optimistic; setup
+                        re-checks */
+                    dlPanel.failed = false;
+                    dlPanel.note[0] = '\0';
+                    ollama_setup_begin(
+                        dlPanel.model);
+                } else {
+                    ollama_pull_begin(
+                        dlPanel.model);
+                }
+            }
+        }
+
         if (hamburger.clicked) {
             sidebar.open = !sidebar.open;
         }
 
         hamburger.open = sidebar.open;
-
-        /*
-            Sidebar button actions.
-        */
-        for (int i = 0; i < SIDEBAR_ITEMS; i++) {
-            if (sidebar.buttons[i].clicked) {
-                switch (i) {
-                case 0:
-                    state.count = 0;
-                    state.input[0] = '\0';
-                    state.input_len = 0;
-                    add_message(&state,
-                        "Hi, I'm Sayri. "
-                        "How can I help?",
-                        false);
-                    break;
-                case 1:
-                    add_message(&state,
-                        "No recent conversations.",
-                        false);
-                    break;
-                case 2:
-                    add_message(&state,
-                        "Search coming soon.",
-                        false);
-                    break;
-                case 3:
-                    add_message(&state,
-                        "Settings coming soon.",
-                        false);
-                    break;
-                }
-            }
-        }
 
         Uint64 now =
             SDL_GetPerformanceCounter();
@@ -631,12 +1321,16 @@ int main(void)
                 (0.0f - m->slide_y) * 8.0f * dt;
         }
 
-        if (state.is_thinking) {
-            state.thinking_timer -= dt;
-            if (state.thinking_timer <= 0) {
-                state.is_thinking = false;
-                simulate_response(&state);
-            }
+        /*
+            Ollama reply?
+        */
+        OllamaReply reply;
+        ollama_poll(&reply);
+
+        if (reply.done) {
+            state.is_thinking = false;
+            add_message(
+                &state, reply.text, false);
         }
 
         /*
@@ -653,6 +1347,13 @@ int main(void)
             rt_w = width;
             rt_h = height;
 
+            /*
+                Linear filtering for the downscale
+                (2x glass -> 1x screen).
+            */
+            SDL_SetHint(
+                SDL_HINT_RENDER_SCALE_QUALITY, "1");
+
             rt =
                 SDL_CreateTexture(
                     renderer,
@@ -663,6 +1364,9 @@ int main(void)
 
             SDL_SetTextureBlendMode(
                 rt, SDL_BLENDMODE_BLEND);
+
+            SDL_SetHint(
+                SDL_HINT_RENDER_SCALE_QUALITY, "0");
         }
 
         /*
@@ -673,7 +1377,7 @@ int main(void)
         SDL_RenderSetScale(renderer, 2.0f, 2.0f);
 
         draw_background(
-            renderer, width, height, time);
+            renderer, &ui, width, height, time);
 
         /*
             Pass 2: downscale glass.
@@ -721,8 +1425,8 @@ int main(void)
             0, 0, 240, height / ui.scale);
 
         sidebar_draw(
-            &sidebar, &ui, renderer, font,
-            boldFont, dt);
+            &sidebar, &ui, renderer,
+            boldFont, menuFont, dt);
 
         /*
             Hamburger button.
@@ -732,7 +1436,7 @@ int main(void)
             15, 15, 40);
 
         hamburger_draw(
-            &hamburger, &ui, renderer, dt);
+            &hamburger, &ui, renderer);
 
         /*
             Chat area.
@@ -741,6 +1445,59 @@ int main(void)
             renderer, &state, &ui, font,
             sbPx + pad, chatTop,
             width - sbPx - pad * 2, chatH);
+
+        /*
+            Orb (Sayri avatar).
+
+            Drawn after the chat panel so it
+            overlaps on top of the glass.
+        */
+        orb_grow +=
+            ((state.is_thinking ? 1.0f : 0.0f) -
+             orb_grow) * 5.0f * dt;
+
+        int chatW =
+            width - sbPx - pad * 2;
+
+        float orbSizeF =
+            (float)chatW * 0.24f *
+            (1.0f + 0.10f * orb_grow);
+
+        if (orbSizeF > height * 0.30f)
+            orbSizeF = height * 0.30f;
+
+        /*
+            Hard cap: never upscale the 256px
+            orb texture much beyond 1:1, or it
+            turns to mush on big screens.
+        */
+        if (orbSizeF > 240.0f)
+            orbSizeF = 240.0f;
+
+        SDL_Rect orbRect = {
+            sbPx + pad +
+                (chatW - (int)orbSizeF) / 2,
+            chatTop + pad,
+            (int)orbSizeF,
+            (int)orbSizeF
+        };
+
+        /*
+            Re-render at half rate: the 256x256
+            CPU shader is 4x the cost of the old
+            128x128 one. Time still advances by
+            the full dt.
+        */
+        orb_dt += dt;
+        frame_count++;
+
+        if ((frame_count & 1) == 0) {
+            orb_update(&orb, orb_dt);
+            orb_dt = 0.0f;
+        }
+
+        orb_draw(
+            &orb, renderer, orbRect);
 
         /*
             Input bar.
@@ -756,20 +1513,76 @@ int main(void)
             Send button.
         */
         draw_send_button(
-            renderer, &state, font,
+            renderer, &state, &ui, font,
             width - pad - sendBtnSize,
             height - pad - inputBarH,
             sendBtnSize);
 
+        /*
+            Settings popover (topmost).
+        */
+        popup_layout(
+            &settings, &ui,
+            (float)width / ui.scale -
+                POPUP_DEFAULT_W - 14.0f,
+            64.0f,
+            POPUP_DEFAULT_W,
+            POPUP_DEFAULT_H);
+
+        popup_draw(
+            &settings, &ui, renderer,
+            font, boldFont, dt);
+
+        /*
+            Recents popover.
+        */
+        popup_layout(
+            &recentsPopup, &ui,
+            70.0f,
+            64.0f,
+            POPUP_DEFAULT_W,
+            recentsPopup.item_count
+                ? POPUP_HEIGHT_FOR(
+                      recentsPopup.item_count)
+                : POPUP_DEFAULT_H);
+
+        popup_draw(
+            &recentsPopup, &ui, renderer,
+            font, boldFont, dt);
+
+        /*
+            Downloads panel (topmost).
+        */
+        downloads_layout(
+            &dlPanel, &ui,
+            (float)width / ui.scale -
+                DL_DEFAULT_W - 14.0f,
+            64.0f,
+            DL_DEFAULT_W,
+            DL_DEFAULT_H);
+
+        downloads_draw(
+            &dlPanel, &ui, renderer,
+            font, boldFont, dt);
+
         SDL_RenderPresent(renderer);
     }
+
+    /*
+        Persist the current conversation on quit.
+    */
+    persist_session(&state);
 
     if (rt)
         SDL_DestroyTexture(rt);
 
+    orb_free(&orb);
+    ollama_shutdown();
+
     TTF_CloseFont(font);
     TTF_CloseFont(titleFont);
     TTF_CloseFont(smallFont);
+    TTF_CloseFont(menuFont);
     if (boldFont) TTF_CloseFont(boldFont);
 
     SDL_DestroyRenderer(renderer);

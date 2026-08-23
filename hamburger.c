@@ -1,5 +1,4 @@
 #include "hamburger.h"
-#include <math.h>
 
 void hamburger_init(
     UIHamburger *hb)
@@ -54,24 +53,8 @@ void hamburger_event(
 void hamburger_draw(
     UIHamburger *hb,
     UIContext *ui,
-    SDL_Renderer *renderer,
-    float dt)
+    SDL_Renderer *renderer)
 {
-    float target =
-        hb->open ? 1.0f : 0.0f;
-
-    hb->anim +=
-        (target - hb->anim) *
-        10.0f * dt;
-
-    if (hb->anim < 0.001f)
-        hb->anim = 0.0f;
-
-    if (hb->anim > 0.999f)
-        hb->anim = 1.0f;
-
-    float t = ui_ease_in_out_cubic(hb->anim);
-
     int radius =
         (int)roundf(
             12.0f * ui->scale
@@ -81,20 +64,15 @@ void hamburger_draw(
         renderer,
         hb->rect,
         radius,
-        hb->anim > 0.01f,
+        hb->open,
         ui->dark
     );
 
     int cx =
         hb->rect.x + hb->rect.w / 2;
 
-    int cy =
-        hb->rect.y + hb->rect.h / 2;
-
     int lineW =
         (int)roundf(16.0f * ui->scale);
-
-    int halfW = lineW / 2;
 
     int gap =
         (int)roundf(5.0f * ui->scale);
@@ -109,78 +87,41 @@ void hamburger_draw(
         renderer,
         SDL_BLENDMODE_BLEND);
 
+    UIColor lineColor =
+        ui_theme(ui->dark,
+            (UIColor){50, 60, 85, 220},
+            (UIColor){208, 216, 236, 230});
+
     SDL_SetRenderDrawColor(
         renderer,
-        50, 60, 85, 220);
+        lineColor.r,
+        lineColor.g,
+        lineColor.b,
+        lineColor.a);
 
-    /*
-        Animate the three lines from hamburger bars
-        to an X shape.
-    */
+    for (int i = -1; i <= 1; i++) {
 
-    float bar_y0 = (float)(cy - gap);
-    float bar_y1 = (float)cy;
-    float bar_y2 = (float)(cy + gap);
-
-    float x_y0 =
-        bar_y0 * (1.0f - t) +
-        (float)cy * t;
-
-    float x_y1 =
-        bar_y1;
-
-    float x_y2 =
-        bar_y2 * (1.0f - t) +
-        (float)cy * t;
-
-    float x_x0_offset =
-        0.0f * (1.0f - t) +
-        (float)(-halfW) * t;
-
-    float x_x2_offset =
-        0.0f * (1.0f - t) +
-        (float)(halfW) * t;
-
-    struct {
-        float y;
-        float x_off;
-    } lines[3] = {
-        { x_y0, x_x0_offset },
-        { x_y1, 0.0f },
-        { x_y2, x_x2_offset }
-    };
-
-    for (int i = 0; i < 3; i++) {
-
-        int ly = (int)roundf(lines[i].y);
-        int lx_off =
-            (int)roundf(lines[i].x_off);
-
-        int x1 = cx - halfW + lx_off;
-        int x2 = cx + halfW + lx_off;
-
-        if (i == 0) {
-            x1 = cx - halfW + lx_off;
-            x2 = cx + halfW + lx_off;
-        }
-
-        if (i == 2) {
-            x1 = cx - halfW + lx_off;
-            x2 = cx + halfW + lx_off;
-        }
+        int ly =
+            hb->rect.y +
+            hb->rect.h / 2 +
+            i * gap;
 
         SDL_RenderDrawLine(
             renderer,
-            x1, ly,
-            x2, ly
+            cx - lineW / 2,
+            ly,
+            cx + lineW / 2,
+            ly
         );
 
         if (lw > 2) {
 
             SDL_RenderDrawLine(
                 renderer,
-                x1, ly + 1,
-                x2, ly + 1
+                cx - lineW / 2,
+                ly + 1,
+                cx + lineW / 2,
+                ly + 1
             );
         }
     }

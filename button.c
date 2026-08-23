@@ -84,24 +84,8 @@ void button_draw(
     UIButton *button,
     UIContext *ui,
     SDL_Renderer *renderer,
-    TTF_Font *font,
-    float dt)
+    TTF_Font *font)
 {
-    float target =
-        (button->hovered ||
-         button->pressed)
-        ? 1.0f : 0.0f;
-
-    button->hover_anim +=
-        (target - button->hover_anim) *
-        14.0f * dt;
-
-    if (button->hover_anim < 0.001f)
-        button->hover_anim = 0.0f;
-
-    if (button->hover_anim > 0.999f)
-        button->hover_anim = 1.0f;
-
     int radius =
         (int)roundf(
             16.0f * ui->scale
@@ -111,25 +95,19 @@ void button_draw(
         renderer,
         button->rect,
         radius,
-        button->hover_anim > 0.01f,
+        button->hovered ||
+        button->pressed,
         ui->dark
     );
 
-    UIColor inactive =
-        ui_theme(ui->dark,
-            (UIColor){30, 40, 58, 255},
-            (UIColor){200, 210, 230, 255});
-
-    UIColor active =
-        ui_theme(ui->dark,
-            (UIColor){30, 85, 210, 255},
-            (UIColor){100, 160, 255, 255});
-
     UIColor textColor =
-        ui_color_lerp(
-            inactive,
-            active,
-            button->hover_anim
+        ui_theme(ui->dark,
+            button->pressed
+            ? (UIColor){30, 85, 210, 255}
+            : (UIColor){30, 40, 58, 255},
+            button->pressed
+            ? (UIColor){100, 160, 255, 255}
+            : (UIColor){200, 210, 230, 255}
         );
 
     ui_text_center(

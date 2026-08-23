@@ -2,15 +2,30 @@
 #define SIDEBAR_H
 
 #include "ui.h"
-#include "button.h"
 
-#define SIDEBAR_ITEMS 4
+#define SIDEBAR_ITEMS 5
+
+/*
+    Item row geometry (design pixels).
+*/
+#define SIDEBAR_ITEM_X    15.0f
+#define SIDEBAR_ITEM_Y    56.0f
+#define SIDEBAR_ITEM_W    210.0f
+#define SIDEBAR_ITEM_H    32.0f
+#define SIDEBAR_ITEM_GAP  38.0f
 
 typedef struct {
     SDL_Rect rect;
     float anim;
     bool open;
-    UIButton buttons[SIDEBAR_ITEMS];
+    const char *items[SIDEBAR_ITEMS];
+
+    /*
+        Last known mouse position (raw window
+        coordinates) for hover states.
+    */
+    int mouse_x;
+    int mouse_y;
 } UISidebar;
 
 void sidebar_init(
@@ -35,8 +50,8 @@ void sidebar_draw(
     UISidebar *sb,
     UIContext *ui,
     SDL_Renderer *renderer,
-    TTF_Font *font,
     TTF_Font *title_font,
+    TTF_Font *item_font,
     float dt
 );
 

@@ -9,8 +9,6 @@ typedef struct {
     float value;
 
     bool dragging;
-
-    float glow_anim;
 } UISlider;
 
 void slider_init(
@@ -35,8 +33,7 @@ void slider_draw(
     UISlider *slider,
     UIContext *ui,
     SDL_Renderer *renderer,
-    TTF_Font *font,
-    float dt
+    TTF_Font *font
 );
 
 #endif /* SLIDER_H */

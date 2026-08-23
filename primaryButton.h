@@ -38,8 +38,7 @@ void primary_button_draw(
     UIPrimaryButton *button,
     UIContext *ui,
     SDL_Renderer *renderer,
-    TTF_Font *font,
-    float dt
+    TTF_Font *font
 );
 
 #endif /* PRIMARY_BUTTON_H */

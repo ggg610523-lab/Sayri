@@ -9,7 +9,6 @@ typedef struct {
     const char *text;
 
     bool checked;
-    float toggle_anim;
 } UICheckBox;
 
 void checkbox_init(
@@ -34,8 +33,7 @@ void checkbox_draw(
     UICheckBox *checkbox,
     UIContext *ui,
     SDL_Renderer *renderer,
-    TTF_Font *font,
-    float dt
+    TTF_Font *font
 );
 
 #endif /* CHECKBOX_H */

@@ -216,7 +216,7 @@ void menubar_draw(
         radius,
         ui_theme(ui->dark,
             (UIColor){255, 255, 255, 80},
-            (UIColor){60, 70, 100, 80})
+            (UIColor){38, 38, 42, 55})
     );
 
     for (int i = 0; i < bar->menuCount; i++) {

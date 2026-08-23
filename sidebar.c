@@ -1,5 +1,4 @@
 #include "sidebar.h"
-#include <math.h>
 
 void sidebar_init(
     UISidebar *sb)
@@ -7,10 +6,13 @@ void sidebar_init(
     sb->open = false;
     sb->anim = 0.0f;
 
-    button_init(&sb->buttons[0], "New Chat");
-    button_init(&sb->buttons[1], "Recent");
-    button_init(&sb->buttons[2], "Search");
-    button_init(&sb->buttons[3], "Settings");
+    sb->items[0] = "Settings";
+    sb->items[1] = "Profile";
+    sb->items[2] = "About";
+    sb->items[3] = "Quit";
+
+    sb->mouse_x = -1;
+    sb->mouse_y = -1;
 }
 
 void sidebar_layout(
@@ -37,10 +39,22 @@ void sidebar_event(
 {
     if (
         event->type ==
+        SDL_MOUSEMOTION
+    ) {
+        sb->mouse_x =
+            event->motion.x;
+
+        sb->mouse_y =
+            event->motion.y;
+    }
+
+    if (
+        event->type ==
         SDL_MOUSEBUTTONDOWN &&
         event->button.button ==
         SDL_BUTTON_LEFT
     ) {
+
         if (
             sb->open &&
             !ui_point_in_rect(
@@ -52,21 +66,14 @@ void sidebar_event(
             sb->open = false;
         }
     }
-
-    if (sb->open) {
-        for (int i = 0; i < SIDEBAR_ITEMS; i++) {
-            button_event(
-                &sb->buttons[i], event);
-        }
-    }
 }
 
 void sidebar_draw(
     UISidebar *sb,
     UIContext *ui,
     SDL_Renderer *renderer,
-    TTF_Font *font,
     TTF_Font *title_font,
+    TTF_Font *item_font,
     float dt)
 {
     float target = sb->open ? 1.0f : 0.0f;
@@ -101,11 +108,22 @@ void sidebar_draw(
             sb->rect.h / ui->scale
         );
 
-    ui_fill_rounded_rect(
-        renderer, vis,
+    ui_glass(
+        renderer,
+        vis,
         0,
-        (UIColor){240, 245, 252, 175});
+        false,
+        ui->dark
+    );
 
+    /*
+        Brand header.
+
+        Drawn to the RIGHT of the hamburger
+        button, which occupies roughly design
+        x 15..55 — so start at 68 and center
+        vertically against it.
+    */
     if (sb->anim > 0.4f) {
 
         float alpha =
@@ -115,44 +133,96 @@ void sidebar_draw(
         if (alpha > 1.0f)
             alpha = 1.0f;
 
+        int fontH =
+            TTF_FontHeight(
+                title_font ? title_font
+                           : item_font);
+
+        int hb_center =
+            (int)roundf(35.0f * ui->scale);
+
         ui_text(
             renderer,
-            title_font,
+            title_font ? title_font
+                       : item_font,
             "Sayri",
-            (int)roundf(25.0f * ui->scale),
-            (int)roundf(60.0f * ui->scale),
+            (int)roundf(68.0f * ui->scale),
+            hb_center - fontH / 2,
             (UIColor){
                 35, 45, 62,
                 (Uint8)(255 * alpha)}
         );
+    }
 
-        float btnX = 15.0f;
-        float btnW = currentW - 30.0f;
-        float btnH = 40.0f;
-        float startY = 100.0f;
-        float gap = 8.0f;
+    /*
+        Glass buttons.
+
+        Drawn late in the slide so the rows never
+        stick out beyond the panel edge.
+    */
+    if (sb->anim > 0.8f) {
+
+        float alpha =
+            (sb->anim - 0.8f) / 0.2f;
+
+        if (alpha > 1.0f)
+            alpha = 1.0f;
+
+        int radius =
+            (int)roundf(
+                SIDEBAR_ITEM_H * 0.5f *
+                ui->scale
+            );
 
         for (int i = 0;
              i < SIDEBAR_ITEMS;
-             i++)
-        {
-            float btnY =
-                startY + i * (btnH + gap);
+             i++) {
 
-            button_layout(
-                &sb->buttons[i],
-                ui,
-                btnX,
-                btnY,
-                btnW,
-                btnH);
+            SDL_Rect row =
+                ui_rect(
+                    ui,
+                    SIDEBAR_ITEM_X,
+                    SIDEBAR_ITEM_Y +
+                        i * SIDEBAR_ITEM_GAP,
+                    SIDEBAR_ITEM_W,
+                    SIDEBAR_ITEM_H
+                );
 
-            button_draw(
-                &sb->buttons[i],
-                ui,
+            bool hovered =
+                ui_point_in_rect(
+                    sb->mouse_x,
+                    sb->mouse_y,
+                    row
+                );
+
+            ui_glass(
                 renderer,
-                font,
-                dt);
+                row,
+                radius,
+                hovered,
+                ui->dark
+            );
+
+            UIColor textColor =
+                ui_theme(ui->dark,
+                    hovered
+                    ? (UIColor){25, 55, 130, 255}
+                    : (UIColor){30, 40, 58, 255},
+                    hovered
+                    ? (UIColor){140, 190, 255, 255}
+                    : (UIColor){205, 205, 212, 255}
+                );
+
+            textColor.a =
+                (Uint8)(textColor.a * alpha);
+
+            ui_text_center(
+                renderer,
+                item_font ? item_font : title_font,
+                sb->items[i],
+                row,
+                textColor
+            );
         }
     }
 }

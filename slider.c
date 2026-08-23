@@ -1,5 +1,4 @@
 #include "slider.h"
-#include <math.h>
 
 static float clamp(
     float value,
@@ -23,7 +22,6 @@ void slider_init(
         clamp(value, 0.0f, 1.0f);
 
     slider->dragging = false;
-    slider->glow_anim = 0.0f;
 }
 
 void slider_layout(
@@ -100,26 +98,8 @@ void slider_draw(
     UISlider *slider,
     UIContext *ui,
     SDL_Renderer *renderer,
-    TTF_Font *font,
-    float dt)
+    TTF_Font *font)
 {
-    float glow_target =
-        slider->dragging ? 1.0f : 0.0f;
-
-    slider->glow_anim +=
-        (glow_target - slider->glow_anim) *
-        10.0f * dt;
-
-    if (slider->glow_anim < 0.001f)
-        slider->glow_anim = 0.0f;
-
-    if (slider->glow_anim > 0.999f)
-        slider->glow_anim = 1.0f;
-
-    float glow =
-        ui_ease_out_cubic(
-            slider->glow_anim);
-
     int labelOffset =
         (int)roundf(
             28.0f * ui->scale
@@ -246,12 +226,8 @@ void slider_draw(
             slider->rect.h / 2 + 2,
         half,
         ui_theme(ui->dark,
-            (UIColor){15, 20, 40,
-                (Uint8)(25 +
-                    (int)(30 * glow))},
-            (UIColor){0, 0, 0,
-                (Uint8)(45 +
-                    (int)(40 * glow))}));
+            (UIColor){15, 20, 40, 25},
+            (UIColor){0, 0, 0, 45}));
 
     /*
         Knob.
@@ -280,11 +256,6 @@ void slider_draw(
 
     if (innerR > 2) {
 
-        Uint8 hl_a =
-            (Uint8)(
-                (ui->dark ? 15 : 30) +
-                (int)(25 * glow));
-
         ui_fill_circle(
             renderer,
             knobX,
@@ -292,6 +263,7 @@ void slider_draw(
                 slider->rect.h / 2 - 1,
             innerR,
             (UIColor){
-                255, 255, 255, hl_a});
+                255, 255, 255,
+                ui->dark ? 15 : 30});
     }
 }

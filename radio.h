@@ -9,7 +9,6 @@ typedef struct {
     const char *text;
 
     bool selected;
-    float select_anim;
 } UIRadio;
 
 void radio_init(
@@ -34,8 +33,7 @@ void radio_draw(
     UIRadio *radio,
     UIContext *ui,
     SDL_Renderer *renderer,
-    TTF_Font *font,
-    float dt
+    TTF_Font *font
 );
 
 #endif /* RADIO_H */
