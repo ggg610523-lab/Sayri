@@ -6,6 +6,8 @@
 #include <stdbool.h>
 #include <string.h>
 #include <math.h>
+#include <ctype.h>
+#include <stdlib.h>
 #include <dirent.h>
 
 #include "ui.h"
@@ -35,10 +37,20 @@ static char g_current_model[128] = OLLAMA_MODEL;
 static char g_models[MAX_MODELS][128];
 static int g_model_count = 0;
 static int g_model_idx = 0;
-static char g_model_label[160];
 
 static HistoryList g_history;
 static char g_item_labels[HISTORY_MAX_FILES][32];
+
+/*
+    Search panel state. Labels are shown in
+    the popup; files[] maps each row back to
+    the session to load ("": empty-state row).
+*/
+static UIPopup searchPopup;
+static UISearchBar searchInput;
+static char g_search_labels[POPUP_MAX_ITEMS][72];
+static char g_search_files[POPUP_MAX_ITEMS][64];
+static char g_last_query[SEARCHBAR_MAX];
 
 /*
     False once /api proves unreachable —
@@ -126,13 +138,6 @@ static void add_message(
     state->count++;
 }
 
-static void refresh_model_label(void)
-{
-    snprintf(g_model_label,
-             sizeof(g_model_label),
-             "Model: %s", g_current_model);
-}
-
 static void persist_session(
     AppState *st)
 {
@@ -160,6 +165,170 @@ static void persist_session(
                  st->cur_session,
                  sizeof(st->cur_session),
                  roles, texts, st->count);
+}
+
+/*
+    ASCII case-insensitive substring search.
+*/
+static bool ci_contains(
+    const char *hay,
+    const char *needle)
+{
+    if (!*needle)
+        return true;
+
+    size_t nlen =
+        strlen(needle);
+
+    for (; *hay; hay++) {
+
+        size_t i = 0;
+
+        while (i < nlen &&
+               hay[i] &&
+               tolower((unsigned char)hay[i]) ==
+                   tolower((unsigned char)needle[i]))
+            i++;
+
+        if (i == nlen)
+            return true;
+
+        if (!hay[i])
+            break;
+    }
+
+    return false;
+}
+
+/*
+    Replace the visible conversation with a
+    saved session.
+*/
+static void load_session_file(
+    AppState *st,
+    const char *name)
+{
+    char (*texts)[HISTORY_TEXT_MAX] =
+        malloc(sizeof(char[MAX_MESSAGES]
+                      [HISTORY_TEXT_MAX]));
+
+    if (!texts)
+        return;
+
+    unsigned char flags[MAX_MESSAGES];
+
+    int n = history_load(
+        name, texts, flags, MAX_MESSAGES);
+
+    st->count = 0;
+    st->cur_session[0] = '\0';
+
+    for (int i = 0; i < n; i++)
+        add_message(st,
+            texts[i],
+            flags[i] != 0);
+
+    snprintf(st->cur_session,
+             sizeof(st->cur_session),
+             "%s", name);
+
+    free(texts);
+}
+
+/*
+    Rebuild the Search popup rows from the
+    query: matches session names and every
+    stored message body.
+*/
+static void rebuild_search_results(void)
+{
+    g_history.count = 0;
+
+    history_list(&g_history);
+
+    const char *q = searchInput.text;
+
+    char (*texts)[HISTORY_TEXT_MAX] =
+        malloc(sizeof(char[MAX_MESSAGES]
+                      [HISTORY_TEXT_MAX]));
+
+    int n = 0;
+
+    for (int k = 0;
+         k < g_history.count &&
+             n < POPUP_MAX_ITEMS;
+         k++) {
+
+        bool hit;
+
+        if (*q == '\0')
+            hit = true;
+        else if (ci_contains(
+                     g_history.names[k], q))
+            hit = true;
+        else {
+            hit = false;
+
+            if (texts) {
+
+                unsigned char flags[
+                    MAX_MESSAGES];
+
+                int m = history_load(
+                    g_history.names[k],
+                    texts, flags,
+                    MAX_MESSAGES);
+
+                for (int i = 0;
+                     i < m && !hit;
+                     i++)
+                    hit = ci_contains(
+                        texts[i], q);
+            }
+        }
+
+        if (!hit)
+            continue;
+
+        snprintf(g_search_files[n],
+                 sizeof(g_search_files[0]),
+                 "%s", g_history.names[k]);
+
+        long t = atol(g_history.names[k]);
+
+        struct tm *tm = localtime(&t);
+
+        strftime(g_search_labels[n],
+                 sizeof(g_search_labels[0]),
+                 "%b %d %H:%M", tm);
+
+        n++;
+    }
+
+    free(texts);
+
+    /*
+        Empty state: one disabled-looking row.
+    */
+    if (n == 0) {
+
+        g_search_files[0][0] = '\0';
+
+        snprintf(g_search_labels[0],
+                 sizeof(g_search_labels[0]),
+                 *q ? "(no matches)"
+                    : "(no saved chats)");
+
+        n = 1;
+    }
+
+    const char *labels[POPUP_MAX_ITEMS];
+
+    for (int k = 0; k < n; k++)
+        labels[k] = g_search_labels[k];
+
+    popup_set_items(&searchPopup,
+                    labels, n);
 }
 
 static void send_user_message(
@@ -797,14 +966,23 @@ int main(void)
     popup_set_row_label(&settings, "Dark Mode");
     popup_link_toggle(&settings, &darkToggle);
 
+    UIDropDown modelDropdown;
+    dropdown_init(&modelDropdown);
+    popup_link_dropdown(
+        &settings, &modelDropdown);
+
     UIPopup recentsPopup;
     popup_init(&recentsPopup, "Recents");
+
+    popup_init(&searchPopup, "Search");
+    searchbar_init(&searchInput);
+    popup_link_search(
+        &searchPopup, &searchInput);
 
     UIDownloads dlPanel;
     downloads_init(&dlPanel, "llama3.2");
 
     ollama_init(g_current_model);
-    refresh_model_label();
 
     SDL_Texture *rt = NULL;
     int rt_w = 0;
@@ -842,15 +1020,25 @@ int main(void)
                     SDLK_ESCAPE)
                     running = false;
 
+                bool sb_focus =
+                    searchPopup.open &&
+                    searchInput.focused;
+
                 if (event.key.keysym.sym ==
-                    SDLK_BACKSPACE &&
+                        SDLK_BACKSPACE &&
+                    !sb_focus &&
                     state.input_len > 0) {
                     state.input_len--;
                     state.input[state.input_len] = '\0';
                 }
 
+                if (sb_focus)
+                    searchbar_event(
+                        &searchInput, &event);
+
                 if (event.key.keysym.sym ==
-                    SDLK_RETURN &&
+                        SDLK_RETURN &&
+                    !sb_focus &&
                     state.input_len > 0 &&
                     !state.is_thinking) {
                     char msg[INPUT_MAX];
@@ -864,13 +1052,20 @@ int main(void)
             }
 
             if (event.type == SDL_TEXTINPUT) {
-                int len = strlen(state.input);
-                int add = strlen(event.text.text);
-                if (len + add < INPUT_MAX - 1) {
-                    strcat(state.input,
-                           event.text.text);
-                    state.input_len =
-                        strlen(state.input);
+
+                if (searchPopup.open &&
+                    searchInput.focused) {
+                    searchbar_event(
+                        &searchInput, &event);
+                } else {
+                    int len = strlen(state.input);
+                    int add = strlen(event.text.text);
+                    if (len + add < INPUT_MAX - 1) {
+                        strcat(state.input,
+                               event.text.text);
+                        state.input_len =
+                            strlen(state.input);
+                    }
                 }
             }
 
@@ -882,6 +1077,7 @@ int main(void)
             */
             popup_event(&settings, &ui, &event);
             popup_event(&recentsPopup, &ui, &event);
+            popup_event(&searchPopup, &ui, &event);
             downloads_event(&dlPanel, &ui, &event);
 
             if (event.type ==
@@ -919,6 +1115,7 @@ int main(void)
                             Recents.
                         */
                         settings.open = false;
+                        searchPopup.open = false;
 
                         g_history.count = 0;
                         history_list(&g_history);
@@ -974,24 +1171,59 @@ int main(void)
                         break;
                     }
 
-                    case 2:
-                        recentsPopup.open = false;
-                        persist_session(&state);
-                        add_message(&state,
-                            "Search coming soon.",
-                            false);
+                    case 2: {
+                        /*
+                            Search saved chats.
+                        */
+                        if (searchPopup.clicked_outside)
+                            break;
+
+                        settings.open = false;
+                        recentsPopup.open =
+                            false;
+
+                        popup_toggle(
+                            &searchPopup);
+
+                        if (searchPopup.open) {
+
+                            searchInput.text[0] =
+                                '\0';
+                            searchInput.len = 0;
+                            searchInput.focused =
+                                true;
+
+                            g_last_query[0] = '\0';
+
+                            /*
+                                First fill happens on
+                                the query-diff check, but
+                                do it now so the panel
+                                isn't blank for a frame.
+                            */
+                            rebuild_search_results();
+                            snprintf(g_last_query,
+                                     sizeof(g_last_query),
+                                     "%s",
+                                     searchInput.text);
+                        }
+
+                        sidebar.open = false;
                         break;
+                    }
 
                     case 3: {
                         /*
                             Downloads panel.
                         */
                         if (settings.clicked_outside ||
-                            recentsPopup.clicked_outside)
+                            recentsPopup.clicked_outside ||
+                            searchPopup.clicked_outside)
                             break;
 
                         settings.open = false;
                         recentsPopup.open = false;
+                        searchPopup.open = false;
 
                         bool was_open =
                             dlPanel.open;
@@ -1058,6 +1290,8 @@ int main(void)
                             if (settings.open) {
                                 recentsPopup.open =
                                     false;
+                                searchPopup.open =
+                                    false;
 
                                 g_model_count =
                                     ollama_fetch_models(
@@ -1065,27 +1299,38 @@ int main(void)
                                         MAX_MODELS);
 
                                 /*
-                                    Point the cycle at
-                                    the active model.
+                                    Rebuild the
+                                    dropdown from the
+                                    live model list and
+                                    point it at the
+                                    active model.
                                 */
-                                g_model_idx = 0;
+                                int n =
+                                    g_model_count >
+                                    0
+                                        ? g_model_count
+                                        : 0;
+
+                                if (n >
+                                    DROPDOWN_MAX_ITEMS)
+                                    n =
+                                        DROPDOWN_MAX_ITEMS;
+
+                                modelDropdown.itemCount =
+                                    0;
 
                                 for (int k = 0;
-                                     k < g_model_count;
-                                     k++) {
+                                     k < n;
+                                     k++)
 
-                                    if (!strcmp(
-                                            g_models[k],
-                                            g_current_model)) {
-                                        g_model_idx = k;
-                                        break;
-                                    }
-                                }
+                                    dropdown_add_item(
+                                        &modelDropdown,
+                                        g_models[k]);
 
-                                refresh_model_label();
-                                popup_set_value(
-                                    &settings,
-                                    g_model_label);
+                                modelDropdown.selected =
+                                    n > 0
+                                        ? g_model_idx
+                                        : -1;
                             }
                         }
 
@@ -1172,55 +1417,66 @@ int main(void)
         if (picked >= 0 &&
             picked < g_history.count) {
 
-            char (*texts)[HISTORY_TEXT_MAX] =
-                malloc(
-                    sizeof(char[MAX_MESSAGES]
-                                  [HISTORY_TEXT_MAX]));
-
-            if (texts) {
-
-                unsigned char flags[
-                    MAX_MESSAGES];
-
-                int n = history_load(
-                    g_history.names[picked],
-                    texts, flags, MAX_MESSAGES);
-
-                state.count = 0;
-                state.cur_session[0] = '\0';
-
-                for (int i = 0; i < n; i++)
-                    add_message(&state,
-                        texts[i],
-                        flags[i] != 0);
-
-                snprintf(state.cur_session,
-                         sizeof(state.cur_session),
-                         "%s",
-                         g_history.names[picked]);
-
-                free(texts);
-            }
+            load_session_file(
+                &state,
+                g_history.names[picked]);
 
             recentsPopup.open = false;
         }
 
-        if (popup_consume_value_click(
-                &settings)) {
+        /*
+            Search popup: live-filter while the
+            query changes; load a clicked row.
+        */
+        if (searchPopup.open) {
 
-            if (g_model_count > 0) {
+            if (strcmp(g_last_query,
+                       searchInput.text) != 0) {
 
-                g_model_idx =
-                    (g_model_idx + 1) %
-                    g_model_count;
+                snprintf(g_last_query,
+                         sizeof(g_last_query),
+                         "%s", searchInput.text);
 
-                snprintf(g_current_model,
-                         sizeof(g_current_model),
-                         "%s", g_models[g_model_idx]);
-
-                ollama_set_model(g_current_model);
-                refresh_model_label();
+                rebuild_search_results();
             }
+
+            int spicked =
+                popup_consume_item_click(
+                    &searchPopup);
+
+            if (spicked >= 0 &&
+                spicked < POPUP_MAX_ITEMS &&
+                g_search_files[spicked][0]) {
+
+                load_session_file(
+                    &state,
+                    g_search_files[spicked]);
+
+                searchPopup.open = false;
+            }
+        }
+
+        /*
+            Settings dropdown: apply a newly
+            picked model.
+        */
+        if (settings.open &&
+            modelDropdown.selected >= 0 &&
+            g_model_count > 0 &&
+            modelDropdown.selected <
+                g_model_count &&
+            modelDropdown.selected !=
+                g_model_idx) {
+
+            g_model_idx =
+                modelDropdown.selected;
+
+            snprintf(g_current_model,
+                     sizeof(g_current_model),
+                     "%s",
+                     g_models[g_model_idx]);
+
+            ollama_set_model(g_current_model);
         }
 
         /*
@@ -1244,7 +1500,7 @@ int main(void)
 
             /*
                 Bootstrap finished: refresh the
-                model list so Settings can cycle
+                model list so Settings can pick
                 immediately.
             */
             g_model_count =
@@ -1266,7 +1522,10 @@ int main(void)
                 }
             }
 
-            refresh_model_label();
+            modelDropdown.selected =
+                g_model_count > 0
+                    ? g_model_idx
+                    : -1;
         }
 
         if (downloads_consume_install_click(
@@ -1294,6 +1553,10 @@ int main(void)
         }
 
         if (hamburger.clicked) {
+            hamburger.clicked = false; /*
+                latch: stays set until the next
+                mouse-up, so consume it or the
+                toggle fires every frame */
             sidebar.open = !sidebar.open;
         }
 
@@ -1527,7 +1790,7 @@ int main(void)
                 POPUP_DEFAULT_W - 14.0f,
             64.0f,
             POPUP_DEFAULT_W,
-            POPUP_DEFAULT_H);
+            POPUP_H_DROPDOWN);
 
         popup_draw(
             &settings, &ui, renderer,
@@ -1548,6 +1811,23 @@ int main(void)
 
         popup_draw(
             &recentsPopup, &ui, renderer,
+            font, boldFont, dt);
+
+        /*
+            Search popover.
+        */
+        popup_layout(
+            &searchPopup, &ui,
+            70.0f,
+            64.0f,
+            POPUP_DEFAULT_W,
+            POPUP_HEIGHT_FOR_SEARCH(
+                searchPopup.item_count
+                    ? searchPopup.item_count
+                    : 1));
+
+        popup_draw(
+            &searchPopup, &ui, renderer,
             font, boldFont, dt);
 
         /*

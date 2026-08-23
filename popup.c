@@ -24,6 +24,8 @@ void popup_init(
         pop->items[i] = NULL;
 
     pop->toggle = NULL;
+    pop->dropdown = NULL;
+    pop->search = NULL;
 
     pop->open = false;
     pop->clicked_outside = false;
@@ -54,6 +56,20 @@ void popup_link_toggle(
     UIToggle *toggle)
 {
     pop->toggle = toggle;
+}
+
+void popup_link_dropdown(
+    UIPopup *pop,
+    UIDropDown *dd)
+{
+    pop->dropdown = dd;
+}
+
+void popup_link_search(
+    UIPopup *pop,
+    UISearchBar *bar)
+{
+    pop->search = bar;
 }
 
 void popup_set_value(
@@ -133,6 +149,25 @@ void popup_layout(
 
     pop->rect =
         ui_rect(ui, x, y, w, h);
+
+    if (pop->dropdown)
+
+        dropdown_layout(
+            pop->dropdown,
+            ui,
+            pop->x + 14.0f,
+            pop->y + POPUP_DD_Y,
+            pop->w - 28.0f);
+
+    if (pop->search)
+
+        searchbar_layout(
+            pop->search,
+            ui,
+            pop->x + 14.0f,
+            pop->y + POPUP_SEARCH_Y,
+            pop->w - 28.0f,
+            POPUP_SEARCH_H);
 }
 
 /* ============================================================
@@ -158,11 +193,15 @@ static SDL_Rect item_row_rect(
     UIContext *ui,
     int index)
 {
+    float base = pop->search
+        ? POPUP_ITEMS_Y_SEARCH
+        : POPUP_ITEMS_Y;
+
     return
         ui_rect(
             ui,
             pop->x + 14.0f,
-            pop->y + POPUP_ITEMS_Y +
+            pop->y + base +
                 index * POPUP_ITEM_STEP - 3.0f,
             pop->w - 28.0f,
             24.0f
@@ -186,6 +225,16 @@ void popup_event(
         pop->mouse_y =
             event->motion.y;
 
+        if (pop->open && pop->search)
+            searchbar_event(
+                pop->search,
+                event);
+
+        if (pop->open && pop->dropdown)
+            dropdown_event(
+                pop->dropdown,
+                event);
+
         return;
     }
 
@@ -202,15 +251,54 @@ void popup_event(
                 pop->rect
             );
 
+        /*
+            Clicked outside: dismiss. The search
+            bar still sees the click so it can
+            unfocus before the panel hides.
+        */
         if (
             !inside &&
             pop->open
         ) {
             /*
-                Clicked outside: dismiss.
+                The expanded dropdown list hangs
+                below the panel; those clicks must
+                reach it instead of dismissing.
             */
-            pop->open = false;
-            pop->clicked_outside = true;
+            bool dd_zone = false;
+
+            if (pop->dropdown) {
+                UIDropDown *dd =
+                    pop->dropdown;
+
+                dd_zone =
+                    ui_point_in_rect(
+                        event->button.x,
+                        event->button.y,
+                        dd->rect
+                    ) || (
+                        dd->open &&
+                        ui_point_in_rect(
+                            event->button.x,
+                            event->button.y,
+                            dd->listRect
+                        )
+                    );
+
+                dropdown_event(
+                    dd,
+                    event);
+            }
+
+            if (pop->search)
+                searchbar_event(
+                    pop->search,
+                    event);
+
+            if (!dd_zone) {
+                pop->open = false;
+                pop->clicked_outside = true;
+            }
 
             return;
         }
@@ -220,6 +308,45 @@ void popup_event(
 
         int mx = event->button.x;
         int my = event->button.y;
+
+        /*
+            Search bar owns clicks in its rect
+            (focus) and the unfocus click
+            elsewhere in the panel.
+        */
+        if (pop->search) {
+
+            searchbar_event(
+                pop->search,
+                event);
+
+            if (ui_point_in_rect(
+                    mx, my,
+                    pop->search->rect))
+                return;
+        }
+
+        if (pop->dropdown) {
+
+            bool in_dd =
+                ui_point_in_rect(
+                    mx, my,
+                    pop->dropdown->rect);
+
+            bool in_list =
+                pop->dropdown->open &&
+                ui_point_in_rect(
+                    mx, my,
+                    pop->dropdown->
+                        listRect);
+
+            dropdown_event(
+                pop->dropdown,
+                event);
+
+            if (in_dd || in_list)
+                return;
+        }
 
         if (
             pop->toggle &&
@@ -345,19 +472,45 @@ void popup_draw(
         div_y);
 
     /*
-        Option row.
+        Embedded search bar sits just under
+        the divider.
     */
-    ui_text(
-        renderer, font,
-        pop->row_label,
-        vis.x + pad,
-        vis.y +
-            (int)roundf(58.0f * ui->scale),
-        ui_theme(ui->dark,
-            (UIColor){45, 55, 75, a},
-            (UIColor){206, 206, 213, a}));
+    if (pop->search) {
 
-    if (pop->toggle) {
+        searchbar_layout(
+            pop->search,
+            ui,
+            pop->x + 14.0f,
+            pop->y + POPUP_SEARCH_Y,
+            pop->w - 28.0f,
+            POPUP_SEARCH_H);
+
+        searchbar_draw(
+            pop->search,
+            ui,
+            renderer,
+            font,
+            dt);
+    }
+
+    /*
+        Option row. Suppressed when the popup
+        embeds a search bar (the field owns
+        that vertical band instead).
+    */
+    if (!pop->search && pop->row_label)
+
+        ui_text(
+            renderer, font,
+            pop->row_label,
+            vis.x + pad,
+            vis.y +
+                (int)roundf(58.0f * ui->scale),
+            ui_theme(ui->dark,
+                (UIColor){45, 55, 75, a},
+                (UIColor){206, 206, 213, a}));
+
+    if (!pop->search && pop->toggle) {
 
         toggle_layout(
             pop->toggle, ui,
@@ -373,6 +526,19 @@ void popup_draw(
             font
         );
     }
+
+    /*
+        Dropdown control (expanded list draws
+        over whatever sits below the panel).
+    */
+    if (pop->dropdown)
+
+        dropdown_draw(
+            pop->dropdown,
+            ui,
+            renderer,
+            font,
+            dt);
 
     /*
         Value row (e.g. model picker).

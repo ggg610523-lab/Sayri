@@ -3,6 +3,8 @@
 
 #include "ui.h"
 #include "toggle.h"
+#include "dropdownmenu.h"
+#include "searchBar.h"
 
 /*
     Default panel size (design pixels).
@@ -17,6 +19,25 @@
 #define POPUP_ITEMS_Y   114.0f
 #define POPUP_ITEM_STEP  28.0f
 #define POPUP_MAX_ITEMS 12
+
+/*
+    Dropdown geometry + panel height that
+    fits the closed control.
+*/
+#define POPUP_DD_Y      82.0f
+#define POPUP_H_DROPDOWN 146.0f
+
+/*
+    Embedded search bar geometry; item rows
+    start lower when a search bar is shown.
+*/
+#define POPUP_SEARCH_Y        50.0f
+#define POPUP_SEARCH_H        38.0f
+#define POPUP_ITEMS_Y_SEARCH  102.0f
+
+#define POPUP_HEIGHT_FOR_SEARCH(n) \
+    (POPUP_ITEMS_Y_SEARCH + \
+     (n) * POPUP_ITEM_STEP + 16.0f)
 
 /*
     Panel height needed for an item list.
@@ -55,6 +76,18 @@ typedef struct {
     int item_count;
 
     UIToggle *toggle;
+
+    /*
+        Optional dropdown control (owned and
+        populated by the caller).
+    */
+    UIDropDown *dropdown;
+
+    /*
+        Optional search bar; item rows filter
+        live while the caller rebuilds them.
+    */
+    UISearchBar *search;
 
     bool open;
 
@@ -99,6 +132,16 @@ void popup_set_row_label(
 void popup_link_toggle(
     UIPopup *pop,
     UIToggle *toggle
+);
+
+void popup_link_dropdown(
+    UIPopup *pop,
+    UIDropDown *dd
+);
+
+void popup_link_search(
+    UIPopup *pop,
+    UISearchBar *bar
 );
 
 void popup_set_value(
