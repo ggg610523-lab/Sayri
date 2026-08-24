@@ -21,6 +21,13 @@ typedef struct {
         a human-readable reason.
     */
     bool ok;
+
+    /*
+        True when the failure was "server not
+        reachable" — the caller can then kick
+        the auto-bootstrap and retry.
+    */
+    bool server_down;
 } OllamaReply;
 
 /*
@@ -88,7 +95,17 @@ int ollama_fetch_models(
 
     body must be a JSON document as produced by
     ollama_build_body().
+
+    server_down (optional) is set to true when
+    the failure was a connection-level one.
 */
+bool ollama_perform_ex(
+    const char *body,
+    char *out,
+    size_t out_size,
+    bool *server_down
+);
+
 bool ollama_perform(
     const char *body,
     char *out,
@@ -146,7 +163,12 @@ void ollama_poll_pull(
          ~1.4 GB, streamed to ~/.local/opt)
       3. extract it (needs system tar + zstd)
       4. start `ollama serve` detached
-      5. pull the model
+      5. pull the model — only when the tag
+         is not installed yet
+
+    Every step is skipped when already done,
+    so calling this repeatedly (app launch,
+    chat-time auto-heal) is cheap.
 
     Poll ollama_poll_setup() every frame.
 */
@@ -180,6 +202,14 @@ bool ollama_setup_begin(
 void ollama_poll_setup(
     OllamaSetup *out
 );
+
+/*
+    Abort any in-flight chat, pull or
+    setup transfer. ollama_shutdown()
+    calls this automatically; expose it
+    for a future Stop button.
+*/
+void ollama_cancel(void);
 
 /*
     Wait for any in-flight request and clean up.

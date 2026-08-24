@@ -9,6 +9,8 @@ void dropdown_init(
     dd->open = false;
     dd->hovered = false;
     dd->anim = 0.0f;
+    dd->item_h = 40;
+    dd->item_pad = 5;
 }
 
 void dropdown_add_item(
@@ -41,16 +43,47 @@ void dropdown_layout(
             45
         );
 
-    int itemH = 40;
+    /*
+        Row metrics are baked once per layout
+        pass so the drawn list and the click
+        hit-test share the same geometry. The
+        old code tested clicks against raw
+        40 px rows while drawing rows at
+        40 * scale — at small scales most
+        clicks missed or picked the wrong row.
+    */
+    int itemH =
+        (int)roundf(40.0f * ui->scale);
 
-    dd->listRect =
-        ui_rect(
-            ui,
-            x,
-            y + 50,
-            w,
-            dd->itemCount * itemH + 10
-        );
+    int pad =
+        (int)roundf(5.0f * ui->scale);
+
+    if (itemH < 1)
+        itemH = 1;
+
+    if (pad < 1)
+        pad = 1;
+
+    dd->item_h = itemH;
+    dd->item_pad = pad;
+
+    /*
+        Built straight in scaled pixels: rows
+        are already scale-adjusted, so pushing
+        them through ui_rect would scale twice.
+    */
+    dd->listRect.x =
+        (int)roundf(x * ui->scale);
+
+    dd->listRect.y =
+        (int)roundf((y + 50.0f) *
+                    ui->scale);
+
+    dd->listRect.w =
+        (int)roundf(w * ui->scale);
+
+    dd->listRect.h =
+        dd->itemCount * itemH + pad * 2;
 }
 
 void dropdown_event(
@@ -105,12 +138,14 @@ void dropdown_event(
                 )
             ) {
 
-                int itemH = 40;
-                int pad = 5;
-
+                /*
+                    Same scaled metrics the list
+                    is drawn with (see layout).
+                */
                 int idx =
                     (my - dd->listRect.y -
-                     pad) / itemH;
+                     dd->item_pad) /
+                    dd->item_h;
 
                 if (
                     idx >= 0 &&
@@ -233,25 +268,15 @@ void dropdown_draw(
 
     if (dd->anim > 0.01f) {
 
-        int itemH =
-            (int)roundf(40.0f * ui->scale);
-        int pad =
-            (int)roundf(5.0f * ui->scale);
+        /*
+            Drawn straight from the same rect
+            and metrics the hit-test uses —
+            what you see is what you click.
+        */
+        int itemH = dd->item_h;
+        int pad = dd->item_pad;
 
-        int listH =
-            (int)(dd->itemCount *
-                  itemH + pad * 2);
-
-        SDL_Rect listVis =
-            ui_rect(
-                ui,
-                dd->rect.x / ui->scale,
-                (dd->rect.y +
-                 dd->rect.h + 5) /
-                    ui->scale,
-                dd->rect.w / ui->scale,
-                listH / ui->scale
-            );
+        SDL_Rect listVis = dd->listRect;
 
         ui_glass(
             renderer,
@@ -271,9 +296,7 @@ void dropdown_draw(
                     i * itemH,
                 listVis.w,
                 itemH
-            };
-
-            bool sel = (i == dd->selected);
+            };            bool sel = (i == dd->selected);
 
             if (sel) {
                 ui_fill_rounded_rect(

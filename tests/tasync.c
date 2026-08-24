@@ -62,6 +62,16 @@ int main(void)
            reply.text);
 
     if (!reply.ok) {
+
+        if (reply.server_down) {
+            printf(
+                "SKIP: no Ollama server "
+                "on :11434\n");
+            ollama_shutdown();
+            free(body);
+            return 0;
+        }
+
         printf("FAIL reply not ok\n");
         return 1;
     }

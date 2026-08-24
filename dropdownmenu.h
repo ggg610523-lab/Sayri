@@ -16,6 +16,15 @@ typedef struct {
     bool open;
     bool hovered;
     float anim;
+
+    /*
+        Scaled row metrics shared by the draw
+        and hit-test paths — they must agree
+        exactly or clicks land on the wrong
+        option (or none).
+    */
+    int item_h;
+    int item_pad;
 } UIDropDown;
 
 void dropdown_init(

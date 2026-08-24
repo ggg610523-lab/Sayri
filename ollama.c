@@ -18,6 +18,13 @@ static char g_model[128] = OLLAMA_DEFAULT_MODEL;
 static SDL_mutex *g_lock = NULL;
 static SDL_Thread *g_thread = NULL;
 static bool g_busy = false;
+
+/*
+    Cooperative cancel: set on shutdown so
+    blocking transfers abort within one
+    progress tick instead of hanging quit.
+*/
+static SDL_atomic_t g_cancel;
 static OllamaReply g_reply;
 
 void ollama_init(
@@ -333,11 +340,42 @@ static size_t http_write_cb(
     return total;
 }
 
-bool ollama_perform(
+/*
+    Progress callback that aborts the
+    transfer once cancellation is requested.
+    libcurl stops immediately when this
+    returns nonzero
+    (CURLE_ABORTED_BY_CALLBACK).
+*/
+static int cancel_xfer_cb(
+    void *clientp,
+    curl_off_t dltotal,
+    curl_off_t dlnow,
+    curl_off_t ultotal,
+    curl_off_t ulnow)
+{
+    (void)clientp;
+    (void)dltotal; (void)dlnow;
+    (void)ultotal; (void)ulnow;
+
+    return SDL_AtomicGet(&g_cancel)
+        ? 1 : 0;
+}
+
+void ollama_cancel(void)
+{
+    SDL_AtomicSet(&g_cancel, 1);
+}
+
+bool ollama_perform_ex(
     const char *body,
     char *out,
-    size_t out_size)
+    size_t out_size,
+    bool *server_down)
 {
+    if (server_down)
+        *server_down = false;
+
     CURL *curl = curl_easy_init();
 
     if (!curl) {
@@ -384,6 +422,13 @@ bool ollama_perform(
         CURLOPT_LOW_SPEED_TIME, 90L);
 
     curl_easy_setopt(curl,
+        CURLOPT_XFERINFOFUNCTION,
+        cancel_xfer_cb);
+
+    curl_easy_setopt(curl,
+        CURLOPT_NOPROGRESS, 0L);
+
+    curl_easy_setopt(curl,
         CURLOPT_NOSIGNAL, 1L);
 
     CURLcode res = curl_easy_perform(curl);
@@ -398,7 +443,15 @@ bool ollama_perform(
 
     bool ok = false;
 
-    if (res != CURLE_OK) {
+    if (res == CURLE_ABORTED_BY_CALLBACK) {
+
+        snprintf(out, out_size,
+                 "(Cancelled.)");
+
+    } else if (res != CURLE_OK) {
+
+        if (server_down)
+            *server_down = true;
 
         snprintf(out, out_size,
             "(Cannot reach Ollama at %s "
@@ -435,6 +488,15 @@ bool ollama_perform(
     free(buf.data);
 
     return ok;
+}
+
+bool ollama_perform(
+    const char *body,
+    char *out,
+    size_t out_size)
+{
+    return ollama_perform_ex(
+        body, out, out_size, NULL);
 }
 
 /* ============================================================
@@ -802,6 +864,14 @@ static int pull_thread(void *data)
         CURLOPT_LOW_SPEED_LIMIT, 1L);
     curl_easy_setopt(curl,
         CURLOPT_LOW_SPEED_TIME, 30L);
+
+    curl_easy_setopt(curl,
+        CURLOPT_XFERINFOFUNCTION,
+        cancel_xfer_cb);
+
+    curl_easy_setopt(curl,
+        CURLOPT_NOPROGRESS, 0L);
+
     curl_easy_setopt(curl,
         CURLOPT_NOSIGNAL, 1L);
 
@@ -825,7 +895,18 @@ static int pull_thread(void *data)
     */
     SDL_LockMutex(g_lock);
 
-    if (!g_pull_state.done) {
+    if (res == CURLE_ABORTED_BY_CALLBACK) {
+
+        g_pull_state.done = true;
+        g_pull_state.active = false;
+        g_pull_state.ok = false;
+
+        snprintf(
+            g_pull_state.error,
+            sizeof(g_pull_state.error),
+            "(Download cancelled.)");
+
+    } else if (!g_pull_state.done) {
 
         g_pull_state.done = true;
         g_pull_state.active = false;
@@ -877,6 +958,8 @@ bool ollama_pull_begin(
            sizeof(g_pull_state));
 
     g_pull_state.active = true;
+
+    SDL_AtomicSet(&g_cancel, 0);
 
     snprintf(g_pull_state.status,
              sizeof(g_pull_state.status),
@@ -1006,6 +1089,7 @@ static void setup_fail(
 */
 static bool probe_server(void)
 {
+
     CURL *curl = curl_easy_init();
 
     if (!curl)
@@ -1038,6 +1122,78 @@ static bool probe_server(void)
 
     return res == CURLE_OK &&
            status == 200;
+}
+
+/*
+    True when the model tag is already
+    installed on the server. Tolerates any
+    explicit or implicit quantizer suffix
+    ("llama3.2" matches "llama3.2:latest").
+*/
+static bool model_installed(
+    const char *model)
+{
+    char names[16][128];
+
+    int n = ollama_fetch_models(
+        names, 16);
+
+    if (n <= 0)
+        return false;
+
+    size_t ml = strlen(model);
+
+    for (int i = 0; i < n; i++) {
+
+        if (!strncmp(names[i], model, ml) &&
+            (names[i][ml] == ':' ||
+             names[i][ml] == '\0'))
+            return true;
+    }
+
+    return false;
+}
+
+/*
+    Rewrite `out` with the first executable
+    `ollama` found on $PATH. Lets the app
+    reuse an existing install instead of
+    pulling down the pinned release again.
+*/
+static bool find_ollama_on_path(
+    char *out,
+    size_t out_size)
+{
+    const char *path = getenv("PATH");
+
+    if (!path || !*path)
+        return false;
+
+    char *dirs = strdup(path);
+
+    if (!dirs)
+        return false;
+
+    char *save = NULL;
+
+    for (char *dir = strtok_r(dirs, ":",
+                              &save);
+         dir;
+         dir = strtok_r(NULL, ":",
+                        &save)) {
+
+        snprintf(out, out_size,
+                 "%s/ollama", dir);
+
+        if (access(out, X_OK) == 0) {
+            free(dirs);
+            return true;
+        }
+    }
+
+    free(dirs);
+
+    return false;
 }
 
 typedef struct {
@@ -1077,7 +1233,8 @@ static int download_xfer_cb(
             mb, total_mb);
     }
 
-    return 0;
+    return SDL_AtomicGet(&g_cancel)
+        ? 1 : 0;
 }
 
 /*
@@ -1140,6 +1297,16 @@ static bool download_file(
 
     curl_easy_cleanup(curl);
     fclose(f);
+
+    if (res == CURLE_ABORTED_BY_CALLBACK) {
+
+        setup_fail(
+            "(Setup cancelled.)");
+
+        unlink(dest_path);
+
+        return false;
+    }
 
     if (res != CURLE_OK ||
         http_status != 200) {
@@ -1221,6 +1388,7 @@ static int setup_thread(void *data)
     char opt_dir[320], bin_dir[320];
     char exe_path[320], models_dir[320];
     char archive[320];
+    char install_dir[320];
 
     snprintf(opt_dir, sizeof(opt_dir),
              "%s/.local/opt/sayri", home);
@@ -1237,6 +1405,10 @@ static int setup_thread(void *data)
              "%s/.local/opt/sayri/"
              "ollama.tar.zst",
              home);
+    snprintf(install_dir,
+             sizeof(install_dir),
+             "%s/.local/opt/sayri/ollama",
+             home);
 
     setup_publish(true, false, false,
                   OLLAMA_SETUP_CHECKING,
@@ -1251,21 +1423,67 @@ static int setup_thread(void *data)
     if (!probe_server()) {
 
         /*
-            Server down: need runtime.
+            Server down: need a runtime. Reuse
+            what is already on the machine
+            first — managed install, then any
+            `ollama` on $PATH — and only hit
+            the network as a last resort.
         */
-        if (stat(exe_path, &st) != 0) {
+        bool managed_ok =
+            stat(exe_path, &st) == 0;
 
-            setup_publish(
-                true, false, false,
-                OLLAMA_SETUP_DOWNLOADING,
-                0.0f,
-                "Downloading Ollama\u2026");
+        if (managed_ok) {
 
-            if (!download_file(
-                    OLLAMA_RELEASE_URL,
-                    archive,
-                    OLLAMA_SETUP_DOWNLOADING))
-                goto fail_keep_file;
+            /*
+                An interrupted extraction leaves
+                the CLI behind without its
+                runners; `serve` then starts but
+                every chat dies with
+                "llama-server binary not found".
+                Treat those as missing.
+            */
+            char lib_dir[512];
+
+            snprintf(lib_dir,
+                     sizeof(lib_dir),
+                     "%s/lib/ollama",
+                     install_dir);
+
+            managed_ok =
+                stat(lib_dir, &st) == 0;
+        }
+
+        if (!managed_ok &&
+            !find_ollama_on_path(
+                exe_path,
+                sizeof(exe_path))) {
+
+            /*
+                A leftover archive from an
+                interrupted run is still usable —
+                skip the 1.4 GB re-download. If
+                it turns out corrupt it is removed
+                below so the next attempt fetches
+                a fresh one.
+            */
+            bool have_archive =
+                stat(archive, &st) == 0 &&
+                st.st_size > 1024 * 1024;
+
+            if (!have_archive) {
+
+                setup_publish(
+                    true, false, false,
+                    OLLAMA_SETUP_DOWNLOADING,
+                    0.0f,
+                    "Downloading Ollama\u2026");
+
+                if (!download_file(
+                        OLLAMA_RELEASE_URL,
+                        archive,
+                        OLLAMA_SETUP_DOWNLOADING))
+                    goto fail_keep_file;
+            }
 
             setup_publish(
                 true, false, false,
@@ -1273,21 +1491,47 @@ static int setup_thread(void *data)
                 0.0f,
                 "Extracting\u2026");
 
+            /*
+                The release tarball has no
+                wrapping directory: it contains
+                bin/ollama at its top level, so
+                extract straight into install_dir
+                where exe_path expects it.
+            */
+            mkdir(install_dir, 0755);
+
             char cmd[760];
             snprintf(cmd, sizeof(cmd),
                      "tar --zstd -xf '%s' "
                      "-C '%s' 2>/dev/null",
-                     archive, opt_dir);
+                     archive, install_dir);
 
             int rc = system(cmd);
 
-            if (rc != 0 ||
-                stat(exe_path, &st) != 0) {
+            if (rc != 0) {
                 setup_fail(
                     "Extraction failed "
                     "(is tar/zstd "
                     "installed?)");
-                goto fail_keep_file;
+                unlink(archive);
+                goto fail_no_file;
+            }
+
+            char lib_dir[512];
+
+            snprintf(lib_dir,
+                     sizeof(lib_dir),
+                     "%s/lib/ollama",
+                     install_dir);
+
+            if (stat(exe_path, &st) != 0 ||
+                stat(lib_dir, &st) != 0) {
+                setup_fail(
+                    "Install layout "
+                    "unexpected after "
+                    "extraction.");
+                unlink(archive);
+                goto fail_no_file;
             }
 
             unlink(archive);
@@ -1295,15 +1539,22 @@ static int setup_thread(void *data)
 
         /*
             Convenience symlink for CLI use.
+            Skipped when the runtime WAS found
+            through that very link, otherwise
+            unlink + symlink would leave it
+            dangling.
         */
         char link_path[512];
         snprintf(link_path,
                  sizeof(link_path),
                  "%s/ollama", bin_dir);
 
-        unlink(link_path);
+        if (strcmp(exe_path, link_path) != 0) {
 
-        symlink(exe_path, link_path);
+            unlink(link_path);
+
+            symlink(exe_path, link_path);
+        }
 
         setup_publish(
             true, false, false,
@@ -1333,8 +1584,22 @@ static int setup_thread(void *data)
 
     /*
         Model pull phase: reuse the pull
-        machinery and mirror its progress.
+        machinery and mirror its progress —
+        but only when the tag is actually
+        missing, so re-runs (app launch,
+        auto-heal) finish in a second.
     */
+    if (model_installed(model)) {
+
+        setup_publish(false, true, true,
+                      OLLAMA_SETUP_DONE,
+                      1.0f, "Ready.");
+
+        free(model);
+
+        return 0;
+    }
+
     setup_publish(true, false, false,
                   OLLAMA_SETUP_PULLING,
                   0.0f,
@@ -1459,6 +1724,8 @@ bool ollama_setup_begin(
     g_setup.stage =
         OLLAMA_SETUP_CHECKING;
 
+    SDL_AtomicSet(&g_cancel, 0);
+
     snprintf(g_setup.status,
              sizeof(g_setup.status),
              "Checking\u2026");
@@ -1524,8 +1791,11 @@ static int worker_thread(void *data)
 
     char text[OLLAMA_MAX_TEXT];
 
-    bool ok = ollama_perform(
-        body, text, sizeof(text));
+    bool server_down = false;
+
+    bool ok = ollama_perform_ex(
+        body, text, sizeof(text),
+        &server_down);
 
     free(body);
 
@@ -1539,6 +1809,7 @@ static int worker_thread(void *data)
              "%s", text);
 
     g_reply.ok = ok;
+    g_reply.server_down = server_down;
     g_reply.done = true;
 
     /*
@@ -1569,6 +1840,8 @@ bool ollama_begin(
     g_reply.done = false;
     g_reply.ok = false;
     g_reply.text[0] = '\0';
+
+    SDL_AtomicSet(&g_cancel, 0);
 
     g_thread = SDL_CreateThread(
         worker_thread, "ollama",
@@ -1607,6 +1880,15 @@ void ollama_poll(
 
 void ollama_shutdown(void)
 {
+    /*
+        Ask every worker to abort its
+        transfer first; joining without
+        this blocks quit until a multi-GB
+        download or 300 s chat timeout
+        finishes.
+    */
+    SDL_AtomicSet(&g_cancel, 1);
+
     if (g_thread) {
         SDL_WaitThread(g_thread, NULL);
         g_thread = NULL;

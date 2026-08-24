@@ -1,16 +1,46 @@
 /*
     Renders the Search popup offscreen and
     saves a BMP for visual inspection.
+
+    Usage: tsearchshot [W H]  (default 1100x700)
+    Fonts are rasterized at the effective ui
+    scale exactly like main.c does.
 */
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
 
 #include "ui.h"
 #include "popup.h"
 
-int main(void)
+static TTF_Font *open_scaled(
+    const char *path, int pt, float scale)
 {
+    int px = (int)roundf(
+        (float)pt * scale);
+
+    if (px < 7)
+        px = 7;
+
+    TTF_Font *f =
+        TTF_OpenFont(path, px);
+
+    if (f)
+        TTF_SetFontHinting(
+            f, TTF_HINTING_LIGHT);
+
+    return f;
+}
+
+int main(int argc, char **argv)
+{
+    int W = argc >= 3 ? atoi(argv[1])
+                      : 1100;
+    int H = argc >= 3 ? atoi(argv[2])
+                      : 700;
+
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
@@ -26,7 +56,7 @@ int main(void)
     SDL_Window *window =
         SDL_CreateWindow(
                 "shot",
-            0, 0, 1100, 700,
+            0, 0, W, H,
             SDL_WINDOW_HIDDEN);
 
     SDL_Renderer *renderer =
@@ -34,18 +64,22 @@ int main(void)
             window, -1,
             SDL_RENDERER_SOFTWARE);
 
+    UIContext ui;
+    ui.dark = true;
+
+    ui_begin(&ui, W, H);
+
     TTF_Font *font =
-        TTF_OpenFont("font/default.ttf", 13);
+        open_scaled("font/default.ttf",
+                    13, ui.scale);
     TTF_Font *boldFont =
-        TTF_OpenFont("font/default.ttf", 15);
+        open_scaled("font/default.ttf",
+                    15, ui.scale);
 
     if (!font || !boldFont) {
         printf("font fail: %s\n", TTF_GetError());
         return 1;
     }
-
-    UIContext ui;
-    ui.dark = true;
 
     UIToggle tgl;
     toggle_init(&tgl, false);
@@ -81,7 +115,7 @@ int main(void)
     */
     for (int frame = 0; frame < 5; frame++) {
 
-        ui_begin(&ui, 1100, 700);
+        ui_begin(&ui, W, H);
 
         SDL_SetRenderDrawColor(
             renderer, 18, 18, 21, 255);
@@ -97,7 +131,7 @@ int main(void)
 
     SDL_Surface *shot =
         SDL_CreateRGBSurfaceWithFormat(
-            0, 1100, 700, 32,
+            0, W, H, 32,
             SDL_PIXELFORMAT_ARGB8888);
 
     SDL_RenderReadPixels(
@@ -115,7 +149,7 @@ int main(void)
 
     for (int frame = 0; frame < 5; frame++) {
 
-        ui_begin(&ui, 1100, 700);
+        ui_begin(&ui, W, H);
 
         SDL_SetRenderDrawColor(
             renderer, 242, 242, 245, 255);

@@ -724,6 +724,360 @@ void ui_fill_circle(
     }
 }
 
+/* ============================================================
+   Signed-distance-field strokes
+   ============================================================ */
+
+/*
+    Evaluate the exact signed distance from
+    point (px, py) to the boundary of a rounded
+    rectangle (negative inside). Classic SDF:
+
+        q = |p - c| - (halfExtent - radius)
+        d = length(max(q, 0))
+            + min(max(q.x, q.y), 0)
+            - radius
+
+    One coverage sample per pixel, so the ring
+    keeps an even width around the corners with
+    no segment joins and no double blending.
+*/
+static float rounded_rect_sdf(
+    float px, float py,
+    float cx, float cy,
+    float half_w, float half_h,
+    float radius)
+{
+    if (radius > half_w)
+        radius = half_w;
+
+    if (radius > half_h)
+        radius = half_h;
+
+    if (radius < 0.0f)
+        radius = 0.0f;
+
+    float qx =
+        fabsf(px - cx) -
+        (half_w - radius);
+
+    float qy =
+        fabsf(py - cy) -
+        (half_h - radius);
+
+    float ox = qx > 0.0f ? qx : 0.0f;
+    float oy = qy > 0.0f ? qy : 0.0f;
+
+    float outside =
+        sqrtf(ox * ox + oy * oy);
+
+    float m = qx > qy ? qx : qy;
+
+    float inside = m < 0.0f ? m : 0.0f;
+
+    return outside + inside - radius;
+}
+
+/*
+    Anti-aliased outline of constant thickness
+    centered on the rect boundary.
+*/
+void ui_stroke_rounded_rect(
+    SDL_Renderer *renderer,
+    SDL_Rect rect,
+    int radius,
+    float width,
+    UIColor color)
+{
+    if (rect.w <= 0 || rect.h <= 0)
+        return;
+
+    if (width < 1.0f)
+        width = 1.0f;
+
+    float hw =
+        (float)rect.w * 0.5f - 0.5f;
+
+    float hh =
+        (float)rect.h * 0.5f - 0.5f;
+
+    float cx =
+        (float)rect.x + hw;
+
+    float cy =
+        (float)rect.y + hh;
+
+    int pad =
+        (int)ceilf(width * 0.5f) + 1;
+
+    int x0 = rect.x - pad;
+    int x1 = rect.x + rect.w - 1 + pad;
+    int y0 = rect.y - pad;
+    int y1 = rect.y + rect.h - 1 + pad;
+
+    SDL_SetRenderDrawBlendMode(
+        renderer,
+        SDL_BLENDMODE_BLEND
+    );
+
+    float half_w = width * 0.5f;
+
+    Uint8 last_a = 0;
+    bool has_last = false;
+
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+
+            float d =
+                rounded_rect_sdf(
+                    (float)x, (float)y,
+                    cx, cy, hw, hh,
+                    (float)radius);
+
+            float cov =
+                0.5f + half_w - fabsf(d);
+
+            if (cov <= 0.0f)
+                continue;
+
+            if (cov > 1.0f)
+                cov = 1.0f;
+
+            Uint8 a = (Uint8)
+                ((float)color.a * cov + 0.5f);
+
+            if (!has_last || a != last_a) {
+
+                SDL_SetRenderDrawColor(
+                    renderer,
+                    color.r, color.g,
+                    color.b, a);
+
+                last_a = a;
+                has_last = true;
+            }
+
+            SDL_RenderDrawPoint(
+                renderer, x, y);
+        }
+    }
+}
+
+/*
+    Anti-aliased ring of constant thickness
+    centered on the circle boundary.
+*/
+void ui_stroke_circle(
+    SDL_Renderer *renderer,
+    int cx, int cy,
+    int radius,
+    float width,
+    UIColor color)
+{
+    if (radius <= 0)
+        return;
+
+    if (width < 1.0f)
+        width = 1.0f;
+
+    int pad =
+        (int)ceilf(width * 0.5f) +
+        1;
+
+    int x0 = cx - radius - pad;
+    int x1 = cx + radius + pad;
+    int y0 = cy - radius - pad;
+    int y1 = cy + radius + pad;
+
+    SDL_SetRenderDrawBlendMode(
+        renderer,
+        SDL_BLENDMODE_BLEND
+    );
+
+    float half_w = width * 0.5f;
+
+    Uint8 last_a = 0;
+    bool has_last = false;
+
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+
+            float dx = (float)(x - cx);
+            float dy = (float)(y - cy);
+
+            float d =
+                sqrtf(dx * dx + dy * dy) -
+                (float)radius;
+
+            float cov =
+                0.5f + half_w - fabsf(d);
+
+            if (cov <= 0.0f)
+                continue;
+
+            if (cov > 1.0f)
+                cov = 1.0f;
+
+            Uint8 a = (Uint8)
+                ((float)color.a * cov + 0.5f);
+
+            if (!has_last || a != last_a) {
+
+                SDL_SetRenderDrawColor(
+                    renderer,
+                    color.r, color.g,
+                    color.b, a);
+
+                last_a = a;
+                has_last = true;
+            }
+
+            SDL_RenderDrawPoint(
+                renderer, x, y);
+        }
+    }
+}
+
+/* ============================================================
+   Smooth (SDF-covered) fills
+   ============================================================ */
+
+/*
+    Coverage from a signed distance: fully
+    solid from half a pixel inside the shape,
+    ramping to nothing half a pixel outside.
+    Small capsules and discs rasterize without
+    the stair-stepping the plain scanline
+    fills show at widget sizes.
+*/
+void ui_fill_rounded_rect_smooth(
+    SDL_Renderer *renderer,
+    SDL_Rect rect,
+    int radius,
+    UIColor color)
+{
+    if (rect.w <= 0 || rect.h <= 0)
+        return;
+
+    float hw =
+        (float)rect.w * 0.5f - 0.5f;
+
+    float hh =
+        (float)rect.h * 0.5f - 0.5f;
+
+    float cx =
+        (float)rect.x + hw;
+
+    float cy =
+        (float)rect.y + hh;
+
+    SDL_SetRenderDrawBlendMode(
+        renderer,
+        SDL_BLENDMODE_BLEND
+    );
+
+    Uint8 last_a = 0;
+    bool has_last = false;
+
+    for (int y = rect.y;
+         y < rect.y + rect.h; y++) {
+        for (int x = rect.x;
+             x < rect.x + rect.w; x++) {
+
+            float d =
+                rounded_rect_sdf(
+                    (float)x, (float)y,
+                    cx, cy, hw, hh,
+                    (float)radius);
+
+            float cov = 0.5f - d;
+
+            if (cov <= 0.0f)
+                continue;
+
+            if (cov > 1.0f)
+                cov = 1.0f;
+
+            Uint8 a = (Uint8)
+                ((float)color.a * cov + 0.5f);
+
+            if (!has_last || a != last_a) {
+
+                SDL_SetRenderDrawColor(
+                    renderer,
+                    color.r, color.g,
+                    color.b, a);
+
+                last_a = a;
+                has_last = true;
+            }
+
+            SDL_RenderDrawPoint(
+                renderer, x, y);
+        }
+    }
+}
+
+void ui_fill_circle_smooth(
+    SDL_Renderer *renderer,
+    int cx, int cy,
+    int radius,
+    UIColor color)
+{
+    if (radius <= 0)
+        return;
+
+    SDL_SetRenderDrawBlendMode(
+        renderer,
+        SDL_BLENDMODE_BLEND
+    );
+
+    Uint8 last_a = 0;
+    bool has_last = false;
+
+    for (int y = cy - radius;
+         y <= cy + radius; y++) {
+        for (int x = cx - radius;
+             x <= cx + radius; x++) {
+
+            float dx =
+                (float)(x - cx);
+
+            float dy =
+                (float)(y - cy);
+
+            float d =
+                sqrtf(dx * dx + dy * dy) -
+                (float)radius;
+
+            float cov = 0.5f - d;
+
+            if (cov <= 0.0f)
+                continue;
+
+            if (cov > 1.0f)
+                cov = 1.0f;
+
+            Uint8 a = (Uint8)
+                ((float)color.a * cov + 0.5f);
+
+            if (!has_last || a != last_a) {
+
+                SDL_SetRenderDrawColor(
+                    renderer,
+                    color.r, color.g,
+                    color.b, a);
+
+                last_a = a;
+                has_last = true;
+            }
+
+            SDL_RenderDrawPoint(
+                renderer, x, y);
+        }
+    }
+}
+
 
 /* ============================================================
    Capsule

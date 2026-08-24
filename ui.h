@@ -81,6 +81,49 @@ void ui_fill_circle(
     UIColor color
 );
 
+/*
+    Constant-thickness anti-aliased outline,
+    centered on the shape boundary. Rendered
+    from a signed distance field, so the ring
+    stays even around the corners (no seams,
+    no double blending).
+*/
+void ui_stroke_rounded_rect(
+    SDL_Renderer *renderer,
+    SDL_Rect rect,
+    int radius,
+    float width,
+    UIColor color
+);
+
+void ui_stroke_circle(
+    SDL_Renderer *renderer,
+    int cx, int cy,
+    int radius,
+    float width,
+    UIColor color
+);
+
+/*
+    SDF-covered fills: like the plain scanline
+    fills but with a true one-pixel coverage
+    ramp at every edge, so small capsules and
+    discs render smooth at any scale.
+*/
+void ui_fill_rounded_rect_smooth(
+    SDL_Renderer *renderer,
+    SDL_Rect rect,
+    int radius,
+    UIColor color
+);
+
+void ui_fill_circle_smooth(
+    SDL_Renderer *renderer,
+    int cx, int cy,
+    int radius,
+    UIColor color
+);
+
 void ui_fill_capsule(
     SDL_Renderer *renderer,
     SDL_Rect rect,

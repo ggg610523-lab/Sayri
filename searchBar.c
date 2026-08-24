@@ -100,58 +100,64 @@ void searchbar_draw(
     float dt)
 {
     /*
-        Capsule-shaped field: border painted
-        as a filled rounded ring (outer rect
-        in border colour, inner rect in fill
-        colour) instead of a stroked path —
-        strokes double-blend where segments
-        join and leave patchy seams.
+        Glass button: one frosted translucent
+        capsule plus a true signed-distance-field
+        stroke. The old version painted the
+        outline as a filled ring (border colour
+        rect under a 1 px smaller fill rect) —
+        the two anti-aliased fringes never line
+        up along the corners, so the border
+        stepped and looked pixelated.
     */
     int radius = bar->rect.h / 2;
 
+    float s = ui->scale;
+
+    /*
+        Frosted material, echoing the popup
+        glass but a touch lighter so the field
+        reads as a raised element on the panel.
+    */
     UIColor fill = ui_theme(ui->dark,
-        (UIColor){255, 255, 255, 255},
-        (UIColor){40, 40, 46, 255});
+        (UIColor){255, 255, 255, 150},
+        (UIColor){255, 255, 255, 26});
 
     UIColor border =
         bar->focused
             ? ui_theme(ui->dark,
-                  (UIColor){0, 0, 0, 90},
-                  (UIColor){255, 255, 255, 78})
+                  (UIColor){0, 0, 0, 110},
+                  (UIColor){255, 255, 255, 120})
             : ui_theme(ui->dark,
-                  (UIColor){0, 0, 0, 46},
-                  (UIColor){255, 255, 255, 36});
+                  (UIColor){0, 0, 0, 52},
+                  (UIColor){255, 255, 255, 56});
 
-    SDL_Rect inner = {
-        bar->rect.x + 1,
-        bar->rect.y + 1,
-        bar->rect.w - 2,
-        bar->rect.h - 2};
-
-    int inner_radius =
-        radius > 2 ? radius - 2 : 0;
+    /*
+        Hairline at small scales, 2 px once the
+        UI is large enough to carry it.
+    */
+    float stroke_w =
+        s >= 1.5f ? 2.0f : 1.0f;
 
     ui_fill_rounded_rect(
         renderer,
         bar->rect,
         radius,
-        border
-    );
-
-    ui_fill_rounded_rect(
-        renderer,
-        inner,
-        inner_radius,
         fill
     );
 
-    /*
-        Magnifier icon: small neutral donut
-        ring + handle. No accent colour — the
-        only blue in the field is the caret.
-    */
-    float s = ui->scale;
+    ui_stroke_rounded_rect(
+        renderer,
+        bar->rect,
+        radius,
+        stroke_w,
+        border
+    );
 
+    /*
+        Magnifier icon: neutral SDF ring +
+        handle. No accent colour — the only
+        blue in the field is the caret.
+    */
     int icx =
         bar->rect.x +
         (int)roundf(17.0f * s);
@@ -162,27 +168,18 @@ void searchbar_draw(
     int ir =
         (int)roundf(4.2f * s);
 
-    /*
-        Ring painted as a filled disc over a
-        slightly smaller disc of the field
-        colour (donut) — no stroked polyline,
-        so no gaps or stepping.
-    */
+    if (ir < 3) ir = 3;
+
     UIColor icon = ui_theme(ui->dark,
         (UIColor){120, 128, 144, 220},
         (UIColor){150, 156, 170, 220});
 
-    if (ir < 3) ir = 3;
-
-    ui_fill_circle(
+    ui_stroke_circle(
         renderer,
-        icx, icy, ir + 1,
-        icon);
-
-    ui_fill_circle(
-        renderer,
-        icx, icy, ir - 1,
-        fill);
+        icx, icy, ir,
+        stroke_w,
+        icon
+    );
 
     /*
         Handle.
@@ -213,11 +210,17 @@ void searchbar_draw(
         hy0 + (int)(hl * sinf(hd)));
 
     /*
-        Text sits right of the icon.
+        Text sits right of the icon, optically
+        centered on the real glyph height so
+        alignment holds at every font size.
     */
     int text_x =
         bar->rect.x +
         (int)roundf(34.0f * s);
+
+    int text_y = bar->rect.y +
+        (bar->rect.h -
+         TTF_FontHeight(font)) / 2;
 
     if (bar->len > 0) {
 
@@ -226,11 +229,7 @@ void searchbar_draw(
             font,
             bar->text,
             text_x,
-            bar->rect.y +
-                (bar->rect.h -
-                 (int)roundf(
-                     19.0f * ui->scale))
-                / 2,
+            text_y,
             ui_theme(ui->dark,
                 (UIColor){30, 40, 58, 255},
                 (UIColor){212, 216, 228, 255})
@@ -243,11 +242,7 @@ void searchbar_draw(
             font,
             "Search chats...",
             text_x,
-            bar->rect.y +
-                (bar->rect.h -
-                 (int)roundf(
-                     19.0f * ui->scale))
-                / 2,
+            text_y,
             ui_theme(ui->dark,
                 (UIColor){104, 114, 138, 255},
                 (UIColor){126, 132, 146, 255})

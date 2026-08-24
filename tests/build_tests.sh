@@ -62,3 +62,22 @@ gcc -Wall -Wextra -O2 -I "$ROOT" \
     -o "$OUT/torb" $LIBS -lm
 
 "$OUT/torb" | tail -2
+
+# --- tcancel: shutdown aborts transfers ---
+
+SDL_CFLAGS="$(sdl2-config --cflags)"
+
+# shellcheck disable=SC2086
+gcc -Wall -Wextra -O2 -I "$ROOT" \
+    $SDL_CFLAGS \
+    "$ROOT/tests/tcancel.c" \
+    "$ROOT/ollama.c" \
+    -o "$OUT/tcancel" $LIBS \
+    -lpthread
+
+timeout 15 "$OUT/tcancel" || {
+    echo "FAIL: tcancel timed out"
+    exit 1
+}
+
+echo "PASS: tcancel"

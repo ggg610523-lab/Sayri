@@ -73,6 +73,16 @@ int main(void)
 
     if (!p.ok || !strstr(p.status,
                          "Installed")) {
+
+        if (strstr(p.error,
+                   "Cannot reach")) {
+            printf(
+                "SKIP: no Ollama server "
+                "on :11434\n");
+            ollama_shutdown();
+            return 0;
+        }
+
         printf("FAIL small pull\n");
         return 1;
     }
