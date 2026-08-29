@@ -18,6 +18,7 @@ mkdir -p "$DEST"
 cp metadata.json "$DEST/"
 cp extension.js  "$DEST/"
 cp orb.js        "$DEST/"
+cp glyph.png     "$DEST/"
 cp stylesheet.css "$DEST/"
 
 if [[ "${1:-}" == "--copy" ]]; then

@@ -37,6 +37,7 @@ sayri-gnome/
 ├── metadata.json       # extension UUID + GNOME 45+ compatibility
 ├── extension.js        # panel button, popup, orb, text field, send, IPC client
 ├── orb.js              # JS port of orb.c (RGBA pixel shader)
+├── glyph.png           # panel icon (loaded via St.Icon.set_gicon)
 ├── stylesheet.css      # Sayri/Pulsar glassmorphism theme
 ├── install.sh          # copy + reload + enable
 └── README.md

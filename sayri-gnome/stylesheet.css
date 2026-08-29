@@ -1,48 +1,69 @@
 /*
  * Sayri GNOME extension stylesheet.
- * Mirrors the Sayri / Pulsar UI glassmorphism palette:
- * deep indigo panels, soft purple accents, translucent chat
- * bubbles. The whole popup shares the app's blue/pink/mint
- * accent family and rounded corners.
+ * Clean, modern web-app aesthetic (ChatGPT / Linear / Notion style):
+ * crisp light surface, flat spacing, transparent assistant replies,
+ * soft-tinted user messages, and a subtle floating input pill.
  */
 
+/* ==================== panel ==================== */
 .sayri-panel {
-    width: 360px;
-    background-color: rgba(24, 26, 32, 0.94);
+    width: 380px;
+    padding: 14px;
+    spacing: 12px;
+
+    background-color: #fafbfd;
     border-radius: 18px;
-    border: 1px solid rgba(255, 255, 255, 0.06);
-    padding: 16px;
+    border: 1px solid rgba(20, 24, 42, 0.08);
+    box-shadow: 0 10px 30px rgba(20, 24, 42, 0.12);
+}
+
+/* ==================== header ==================== */
+.sayri-header {
+    padding: 4px 2px 8px 2px;
+}
+.sayri-header-title {
+    font-family: "Cantarell";
+    font-size: 18px;
+    font-weight: 800;
+    letter-spacing: 0.2px;
+    color: #0f172a;
+}
+
+/* ==================== orb (small, elegant) ==================== */
+.sayri-orb-wrap {
+    padding: 2px;
+}
+
+/* ==================== transcript ==================== */
+.sayri-scroll {
+    min-height: 220px;
+    max-height: 360px;
+    border-radius: 14px;
+    background-color: #ffffff;
+    border: 1px solid rgba(20, 24, 42, 0.06);
+}
+.sayri-bubbles {
+    padding: 12px;
     spacing: 12px;
 }
 
-/* ---- orb ---- */
-.sayri-orb-wrap {
-    padding: 6px;
-}
-
-/* ---- transcript ---- */
-.sayri-scroll {
-    min-height: 180px;
-    max-height: 320px;
-    border-radius: 14px;
-    background-color: rgba(255, 255, 255, 0.03);
-}
-.sayri-bubbles {
-    padding: 10px;
-    spacing: 8px;
-}
+/* assistant: soft light bubble */
 .sayri-bubble {
-    font-size: 13px;
-    padding: 9px 12px;
-    border-radius: 14px;
+    font-size: 13.5px;
+    line-height: 1.45;
 }
 .sayri-bubble-ai {
-    background-color: rgba(255, 255, 255, 0.06);
-    color: #d8deee;
+    border-radius: 16px;
+    background-color: #f3f4f6;
+    color: #1f2937;
+    padding: 8px 12px;
 }
+/* user: soft indigo-tinted message */
 .sayri-bubble-user {
-    background-color: rgba(98, 130, 235, 0.38);
-    color: #e5eaff;
+    border-radius: 16px;
+    background-color: #eef1ff;
+    color: #1e2a52;
+    padding: 8px 12px;
 }
 .sayri-bubble-ai-row {
     x-align: start;
@@ -51,39 +72,64 @@
     x-align: end;
 }
 
-/* ---- input row ---- */
-.sayri-input-row {
-    spacing: 8px;
-}
-.sayri-entry {
-    border-radius: 14px;
-    background-color: rgba(255, 255, 255, 0.05);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    color: #e2e8fa;
-    caret-color: #7c9bff;
-    padding: 5px 12px;
-    min-height: 36px;
-}
-.sayri-entry:focus {
-    border-color: rgba(124, 155, 255, 0.7);
+/* typing indicator: soft neutral pill */
+.sayri-typing-bubble {
+    border-radius: 16px;
+    padding: 6px 12px;
+    background-color: #f3f4f6;
+    color: #6b7280;
+    font-size: 12.5px;
 }
 
-/* Circular send button (the ↑). */
+/* ==================== input row ==================== */
+.sayri-input-row {
+    spacing: 10px;
+}
+.sayri-entry {
+    border-radius: 24px;
+    background-color: #ffffff;
+    border: 1px solid rgba(20, 24, 42, 0.14);
+    color: #111827;
+    caret-color: #6366f1;
+    padding: 0px 18px;
+    height: 54px;
+    font-size: 14px;
+    box-shadow: 0 2px 6px rgba(20, 24, 42, 0.06);
+}
+.sayri-entry:hover {
+    border-color: rgba(20, 24, 42, 0.24);
+}
+.sayri-entry:focus {
+    border-color: #6366f1;
+    box-shadow: 0 2px 12px rgba(99, 102, 241, 0.22);
+}
+
+/* circular send button with a soft indigo→violet accent */
 .sayri-send {
-    min-width: 38px;
-    min-height: 38px;
-    border-radius: 19px;
-    background-color: rgba(90, 130, 255, 0.85);
+    min-width: 54px;
+    min-height: 54px;
+    border-radius: 999px;
+    background-gradient-direction: vertical;
+    background-gradient-start: #6366f1;
+    background-gradient-end: #8b5cf6;
     color: #ffffff;
-    font-size: 18px;
-    font-weight: bold;
+    font-size: 20px;
+    font-weight: 700;
     padding: 0px;
+    box-shadow: 0 2px 8px rgba(99, 102, 241, 0.35);
 }
 .sayri-send:hover {
-    background-color: rgba(110, 160, 255, 0.95);
+    background-gradient-start: #7176f3;
+    background-gradient-end: #9a6bff;
+}
+.sayri-send:active {
+    background-gradient-start: #5658d8;
+    background-gradient-end: #7a4ce0;
 }
 .sayri-send:disabled,
 .sayri-send:insensitive {
-    background-color: rgba(90, 100, 130, 0.4);
-    color: rgba(255, 255, 255, 0.4);
+    background-gradient-start: #e5e7eb;
+    background-gradient-end: #d1d5db;
+    color: #9ca3af;
+    box-shadow: none;
 }

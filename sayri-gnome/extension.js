@@ -37,13 +37,18 @@ const MAX_MSGS = 40;
  */
 const SayriIndicator = GObject.registerClass(
 class SayriIndicator extends PanelMenu.Button {
-    constructor() {
+    constructor(glyphPath) {
         super(0.0, 'Sayri Assistant', false);
 
-        this.add_child(new St.Icon({
-            icon_name: 'face-smile-symbolic',
+        const icon = new St.Icon({
             style_class: 'system-status-icon',
-        }));
+            icon_size: 18,
+        });
+        if (glyphPath && GLib.file_test(glyphPath, GLib.FileTest.EXISTS))
+            icon.set_gicon(Gio.icon_new_for_string(glyphPath));
+        else
+            icon.icon_name = 'face-smile-symbolic';
+        this.add_child(icon);
 
         this._pending = false;
         this._lastTime = 0;
@@ -60,19 +65,28 @@ class SayriIndicator extends PanelMenu.Button {
 
         const box = new St.BoxLayout({vertical: true, style_class: 'sayri-panel'});
 
-        /* ---- orb actor ---- */
-        const ORB_SIZE = 150;
+        /* ---- header: title ---- */
+        const header = new St.BoxLayout({style_class: 'sayri-header'});
+        header.add_child(new St.Label({
+            text: 'Sayri',
+            style_class: 'sayri-header-title',
+        }));
+        box.add_child(header);
+
+        /* ---- orb actor (small, centered) ---- */
+        const ORB_SIZE = 96;
 
         this._orbActor = new St.Widget({
             width: ORB_SIZE,
             height: ORB_SIZE,
             reactive: false,
         });
-        this._imageContent = St.ImageContent.new_with_preferred_size(RES, RES);
+        this._imageContent = St.ImageContent.new_with_preferred_size(ORB_SIZE, ORB_SIZE);
         this._orbActor.set_content(this._imageContent);
 
         box.add_child(new St.Bin({
             style_class: 'sayri-orb-wrap',
+            x_align: Clutter.ActorAlign.CENTER,
             child: this._orbActor,
         }));
 
@@ -94,6 +108,8 @@ class SayriIndicator extends PanelMenu.Button {
             style_class: 'sayri-entry',
             hint_text: 'Ask Sayri…',
             can_focus: true,
+            x_expand: true,
+            x_align: Clutter.ActorAlign.STRETCH,
         });
         this._entry.set_can_focus(true);
         this._entry.connect('key-press-event', this._onKey.bind(this));
@@ -125,9 +141,16 @@ class SayriIndicator extends PanelMenu.Button {
             x_align: Clutter.ActorAlign.START,
         });
         label.get_clutter_text().line_wrap = true;
-        const bin = new St.Bin({child: label});
-        bin.style_class = isUser ? 'sayri-bubble-user-row' : 'sayri-bubble-ai-row';
-        this._bubbles.add_child(bin);
+
+        let row;
+        if (isUser) {
+            row = new St.Bin({child: label});
+            row.style_class = 'sayri-bubble-user-row';
+        } else {
+            row = new St.Bin({child: label});
+            row.style_class = 'sayri-bubble-ai-row';
+        }
+        this._bubbles.add_child(row);
 
         const vadj = this._scroll.get_vadjustment();
         GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
@@ -181,6 +204,30 @@ class SayriIndicator extends PanelMenu.Button {
     _setBusy(busy) {
         this._send.reactive = !busy;
         this._send.set_opacity(busy ? 140 : 255);
+
+        if (busy) {
+            if (!this._typing) {
+                this._typing = new St.Label({
+                    text: 'Sayri is thinking…',
+                    style_class: 'sayri-typing-bubble',
+                    x_align: Clutter.ActorAlign.START,
+                });
+                this._bubbles.add_child(this._typing);
+            }
+        } else {
+            if (this._typing) {
+                this._bubbles.remove_child(this._typing);
+                this._typing = null;
+            }
+        }
+
+        const vadj = this._scroll.get_vadjustment();
+        GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            const after = vadj.get_upper() - vadj.get_page_size();
+            if (after > vadj.get_value())
+                vadj.set_value(after);
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     /* ------------------------------------------------------------ IPC */
@@ -314,7 +361,7 @@ class SayriIndicator extends PanelMenu.Button {
 
 export default class SayriAssistantExtension extends Extension {
     enable() {
-        this._indicator = new SayriIndicator();
+        this._indicator = new SayriIndicator(`${this.path}/glyph.png`);
         Main.panel.addToStatusArea('sayri-assistant', this._indicator, 0, 'right');
     }
 
