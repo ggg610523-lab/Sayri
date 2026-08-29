@@ -21,6 +21,7 @@
 #include "downloads.h"
 #include "ollama.h"
 #include "history.h"
+#include "ipc.h"
 #include <time.h>
 
 #ifndef M_PI
@@ -68,6 +69,13 @@ static bool g_server_ok = true;
 */
 static bool g_retry_pending = false;
 static int g_autoheal_attempts = 0;
+
+/*
+    IPC reply routing: a client connects, sends one
+    message; the answer is written back to this fd
+    when the current turn resolves.
+*/
+static int g_ipc_fd = -1;
 
 static UIColor lerp_color(
     UIColor a, UIColor b, float t)
@@ -496,6 +504,19 @@ static void send_user_message(
     g_autoheal_attempts = 0;
 
     dispatch_chat(state);
+}
+
+/*
+    Deliver a finished reply to the IPC client (if
+    any) and clear the routing slot.
+*/
+static void deliver_ipc_reply(const char *text)
+{
+    if (g_ipc_fd < 0)
+        return;
+
+    ipc_reply(g_ipc_fd, text);
+    g_ipc_fd = -1;
 }
 
 static int sidebar_item_at(
@@ -1170,6 +1191,19 @@ int main(void)
     */
     ollama_setup_begin(g_current_model);
 
+    /*
+        IPC socket: lets a GNOME extension (or any
+        local client) message this running app and
+        read back the assistant's reply.
+    */
+    {
+        char ipc_path[256] = "";
+        if (ipc_start(ipc_path, sizeof(ipc_path)) == 0)
+            printf("Sayri IPC socket: %s\n", ipc_path);
+        else
+            printf("Sayri IPC socket unavailable\n");
+    }
+
     SDL_Texture *rt = NULL;
     int rt_w = 0;
     int rt_h = 0;
@@ -1811,6 +1845,35 @@ int main(void)
         }
 
         /*
+            IPC clients: accept one message at a
+            time and route it through the normal
+            chat so it shows in the window too.
+        */
+        {
+            char ipc_msg[IPC_MAX_MSG];
+            int ipc_fd = ipc_recv(ipc_msg,
+                                  sizeof(ipc_msg));
+
+            if (ipc_fd >= 0) {
+                if (g_ipc_fd >= 0) {
+                    /* Busy: another IPC turn pending. */
+                    ipc_reply(ipc_fd,
+                        "(Sayri is busy - try again "
+                        "in a moment.)");
+                } else if (!state.is_thinking &&
+                           !g_retry_pending) {
+                    g_ipc_fd = ipc_fd;
+                    send_user_message(&state,
+                                      ipc_msg);
+                } else {
+                    ipc_reply(ipc_fd,
+                        "(Sayri is busy - try again "
+                        "in a moment.)");
+                }
+            }
+        }
+
+        /*
             Ollama reply?
         */
         OllamaReply reply;
@@ -1850,6 +1913,12 @@ int main(void)
 
                 add_message(
                     &state, reply.text, false);
+
+                /*
+                    A terminal reply resolves any
+                    pending IPC turn.
+                */
+                deliver_ipc_reply(reply.text);
             }
         }
 
@@ -2113,6 +2182,8 @@ int main(void)
     if (rt)
         SDL_DestroyTexture(rt);
 
+    deliver_ipc_reply("(Sayri closed.)");
+    ipc_stop();
     orb_free(&orb);
     ollama_shutdown();
 

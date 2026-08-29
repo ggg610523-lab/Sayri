@@ -1,0 +1,89 @@
+/*
+ * Sayri GNOME extension stylesheet.
+ * Mirrors the Sayri / Pulsar UI glassmorphism palette:
+ * deep indigo panels, soft purple accents, translucent chat
+ * bubbles. The whole popup shares the app's blue/pink/mint
+ * accent family and rounded corners.
+ */
+
+.sayri-panel {
+    width: 360px;
+    background-color: rgba(24, 26, 32, 0.94);
+    border-radius: 18px;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    padding: 16px;
+    spacing: 12px;
+}
+
+/* ---- orb ---- */
+.sayri-orb-wrap {
+    padding: 6px;
+}
+
+/* ---- transcript ---- */
+.sayri-scroll {
+    min-height: 180px;
+    max-height: 320px;
+    border-radius: 14px;
+    background-color: rgba(255, 255, 255, 0.03);
+}
+.sayri-bubbles {
+    padding: 10px;
+    spacing: 8px;
+}
+.sayri-bubble {
+    font-size: 13px;
+    padding: 9px 12px;
+    border-radius: 14px;
+}
+.sayri-bubble-ai {
+    background-color: rgba(255, 255, 255, 0.06);
+    color: #d8deee;
+}
+.sayri-bubble-user {
+    background-color: rgba(98, 130, 235, 0.38);
+    color: #e5eaff;
+}
+.sayri-bubble-ai-row {
+    x-align: start;
+}
+.sayri-bubble-user-row {
+    x-align: end;
+}
+
+/* ---- input row ---- */
+.sayri-input-row {
+    spacing: 8px;
+}
+.sayri-entry {
+    border-radius: 14px;
+    background-color: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: #e2e8fa;
+    caret-color: #7c9bff;
+    padding: 5px 12px;
+    min-height: 36px;
+}
+.sayri-entry:focus {
+    border-color: rgba(124, 155, 255, 0.7);
+}
+
+/* Circular send button (the ↑). */
+.sayri-send {
+    min-width: 38px;
+    min-height: 38px;
+    border-radius: 19px;
+    background-color: rgba(90, 130, 255, 0.85);
+    color: #ffffff;
+    font-size: 18px;
+    font-weight: bold;
+    padding: 0px;
+}
+.sayri-send:hover {
+    background-color: rgba(110, 160, 255, 0.95);
+}
+.sayri-send:disabled,
+.sayri-send:insensitive {
+    background-color: rgba(90, 100, 130, 0.4);
+    color: rgba(255, 255, 255, 0.4);
+}

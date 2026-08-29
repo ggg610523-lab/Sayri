@@ -150,6 +150,24 @@ void popup_layout(
     pop->rect =
         ui_rect(ui, x, y, w, h);
 
+    /*
+        Same placement as the draw path below
+        so the toggle's click rect is valid
+        from the moment the popup opens —
+        previously it was only laid out while
+        drawing, and clicks before the first
+        settled frame landed on an
+        uninitialized rect.
+    */
+    if (!pop->search && pop->toggle)
+
+        toggle_layout(
+            pop->toggle, ui,
+            pop->x + pop->w -
+                14.0f - 46.0f - 54.0f,
+            pop->y + 54.0f,
+            46.0f, 26.0f);
+
     if (pop->dropdown)
 
         dropdown_layout(

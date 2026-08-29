@@ -42,7 +42,8 @@ SOURCES = \
     popup.c \
     history.c \
     downloads.c \
-    ollama.c
+    ollama.c \
+    ipc.c
 
 OBJECTS = $(SOURCES:.c=.o)
 
