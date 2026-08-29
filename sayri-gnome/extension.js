@@ -122,7 +122,7 @@ class SayriIndicator extends PanelMenu.Button {
             text,
             style_class: isUser ? 'sayri-bubble sayri-bubble-user'
                                 : 'sayri-bubble sayri-bubble-ai',
-            x_align: Clutter.ActorAlign.START,
+            x_align: isUser ? Clutter.ActorAlign.END : Clutter.ActorAlign.START,
         });
         label.get_clutter_text().line_wrap = true;
         const bin = new St.Bin({child: label});

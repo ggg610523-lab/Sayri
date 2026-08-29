@@ -35,14 +35,17 @@
     font-size: 13px;
     padding: 9px 12px;
     border-radius: 14px;
+    max-width: 78%;
 }
 .sayri-bubble-ai {
     background-color: rgba(255, 255, 255, 0.06);
     color: #d8deee;
+    margin-right: auto;
 }
 .sayri-bubble-user {
     background-color: rgba(98, 130, 235, 0.38);
     color: #e5eaff;
+    margin-left: auto;
 }
 .sayri-bubble-ai-row {
     x-align: start;
