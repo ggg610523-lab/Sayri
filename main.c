@@ -11,6 +11,10 @@
 #include <stdlib.h>
 #include <dirent.h>
 #include <unistd.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <net/if.h>
 
 #include "ui.h"
 #include "hamburger.h"
@@ -22,6 +26,7 @@
 #include "ollama.h"
 #include "history.h"
 #include "ipc.h"
+#include "relay.h"
 #include <time.h>
 
 #ifndef M_PI
@@ -76,6 +81,9 @@ static int g_autoheal_attempts = 0;
     when the current turn resolves.
 */
 static int g_ipc_fd = -1;
+static bool g_relay_ok = false;
+static bool g_pair_box = false;
+static char g_pair_code[RELAY_CODE_LEN + 1] = "";
 
 static UIColor lerp_color(
     UIColor a, UIColor b, float t)
@@ -545,6 +553,167 @@ static int sidebar_item_at(
     }
 
     return -1;
+}
+
+/*
+    Rect of the sidebar's "Pair devices" button,
+    drawn just below the regular menu items.
+*/
+static SDL_Rect pair_row_rect(UIContext *ui)
+{
+    return ui_rect(ui,
+        SIDEBAR_ITEM_X,
+        SIDEBAR_ITEM_Y +
+            SIDEBAR_ITEMS * SIDEBAR_ITEM_GAP + 14.0f,
+        SIDEBAR_ITEM_W,
+        SIDEBAR_ITEM_H + 8.0f);
+}
+
+/*
+    Draw the sidebar pairing button + (when opened) a small
+    panel showing the host/port, the live pairing code and a
+    "New code" action.
+*/
+static int lan_ipv4(char *out, size_t out_size);
+
+static void draw_pair_controls(
+    SDL_Renderer *renderer, UIContext *ui,
+    TTF_Font *font, float sidebar_anim)
+{
+    if (!g_relay_ok || sidebar_anim < 0.8f)
+        return;
+
+    float alpha = (sidebar_anim - 0.8f) / 0.2f;
+    if (alpha > 1.0f) alpha = 1.0f;
+
+    relay_code(g_pair_code, sizeof(g_pair_code));
+
+    SDL_Rect row = pair_row_rect(ui);
+
+    int radius = (int)roundf(
+        SIDEBAR_ITEM_H * 0.5f * ui->scale);
+
+    ui_glass(renderer, row, radius, g_pair_box, ui->dark);
+
+    char label[96];
+    snprintf(label, sizeof(label),
+             "Pair devices \u2014 code %s",
+             g_pair_code);
+
+    UIColor lc = ui_theme(ui->dark,
+        (UIColor){25, 55, 130, 255},
+        (UIColor){140, 190, 255, 255});
+    lc.a = (Uint8)(lc.a * alpha);
+    ui_text(renderer, font, label,
+            row.x + (int)roundf(14.0f * ui->scale),
+            row.y + (row.h - TTF_FontHeight(font)) / 2,
+            lc);
+
+    if (!g_pair_box)
+        return;
+
+    /* Expanded panel below the button. */
+    SDL_Rect panel = {
+        row.x,
+        row.y + row.h + (int)roundf(8.0f * ui->scale),
+        row.w,
+        (int)roundf(122.0f * ui->scale)
+    };
+    ui_glass(renderer, panel, (int)roundf(14.0f * ui->scale),
+             false, ui->dark);
+
+    char ip[64] = "";
+    bool have_ip = lan_ipv4(ip, sizeof(ip));
+
+    char line[128];
+    snprintf(line, sizeof(line),
+             "Connect from your phone:");
+    ui_text(renderer, font, line,
+            panel.x + (int)roundf(14.0f * ui->scale),
+            panel.y + (int)roundf(12.0f * ui->scale),
+            ui_theme(ui->dark,
+                     (UIColor){80, 90, 110, 230},
+                     (UIColor){150, 158, 178, 230}));
+
+    char addr_line[160];
+    snprintf(addr_line, sizeof(addr_line),
+             "IP %s:%d", have_ip ? ip : "?.?.?.?", RELAY_PORT);
+    ui_text(renderer, font, addr_line,
+            panel.x + (int)roundf(14.0f * ui->scale),
+            panel.y + (int)roundf(32.0f * ui->scale),
+            ui_theme(ui->dark,
+                     (UIColor){30, 40, 58, 255},
+                     (UIColor){205, 205, 212, 255}));
+
+    char code_line[128];
+    snprintf(code_line, sizeof(code_line),
+             "Pairing code %s", g_pair_code);
+    ui_text(renderer, font, code_line,
+            panel.x + (int)roundf(14.0f * ui->scale),
+            panel.y + (int)roundf(52.0f * ui->scale),
+            ui_theme(ui->dark,
+                     (UIColor){30, 40, 58, 255},
+                     (UIColor){205, 205, 212, 255}));
+
+    SDL_Rect newbtn = {
+        panel.x + (int)roundf(12.0f * ui->scale),
+        panel.y + (int)roundf(78.0f * ui->scale),
+        (int)roundf(90.0f * ui->scale),
+        (int)roundf(28.0f * ui->scale)
+    };
+    ui_glass(renderer, newbtn,
+             (int)roundf(14.0f * ui->scale),
+             false, ui->dark);
+    ui_text_center(renderer, font, "New code", newbtn,
+        ui_theme(ui->dark,
+                 (UIColor){25, 55, 130, 255},
+                 (UIColor){150, 210, 255, 255}));
+}
+
+static bool pair_new_code_rect(UIContext *ui, SDL_Rect *out)
+{
+    SDL_Rect row = pair_row_rect(ui);
+    out->x = row.x + (int)roundf(12.0f * ui->scale);
+    out->y = row.y + row.h + (int)roundf(86.0f * ui->scale);
+    out->w = (int)roundf(90.0f * ui->scale);
+    out->h = (int)roundf(28.0f * ui->scale);
+    return true;
+}
+
+/*
+    Store the first private IPv4 address of this machine (the one a
+    phone on the same LAN uses to reach the relay) in out.
+    Returns 1 on success, 0 if none found.
+*/
+static int lan_ipv4(char *out, size_t out_size)
+{
+    struct ifaddrs *ifa0 = NULL;
+    if (getifaddrs(&ifa0) != 0)
+        return 0;
+
+    int found = 0;
+    for (struct ifaddrs *ifa = ifa0; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr ||
+            ifa->ifa_addr->sa_family != AF_INET)
+            continue;
+        if (!(ifa->ifa_flags & IFF_UP))
+            continue;
+        struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
+        unsigned long ip = ntohl(sa->sin_addr.s_addr);
+        bool private_net =
+            (ip >> 24) == 10 ||                                   /* 10.x.x.x  */
+            (((ip >> 16) & 0xff) == 172 && ((ip >> 8) & 0xf0) == 16) || /* 172.16-31 */
+            (((ip >> 24) == 192) && ((ip >> 16) & 0xff) == 168);  /* 192.168.x */
+        if (private_net &&
+            strcmp(ifa->ifa_name, "lo") != 0) {
+            snprintf(out, out_size, "%s",
+                     inet_ntoa(sa->sin_addr));
+            found = 1;
+            break;
+        }
+    }
+    freeifaddrs(ifa0);
+    return found;
 }
 
 #define CHAT_WRAP_LINES 24
@@ -1204,6 +1373,24 @@ int main(void)
             printf("Sayri IPC socket unavailable\n");
     }
 
+    /*
+        Relay: let a paired phone stream the AI out
+        of this desktop (the phone can't run Ollama).
+        Always on; prints the pairing code to console.
+    */
+    {
+        if (relay_start() == 0) {
+            g_relay_ok = true;
+            char code[RELAY_CODE_LEN + 1] = "";
+            relay_code(code, sizeof(code));
+            printf("Sayri device sharing on port %d, "
+                   "pairing code %s\n",
+                   RELAY_PORT, code);
+        } else {
+            printf("Sayri device sharing unavailable\n");
+        }
+    }
+
     SDL_Texture *rt = NULL;
     int rt_w = 0;
     int rt_h = 0;
@@ -1227,6 +1414,8 @@ int main(void)
             window, &width, &height);
 
         ui_begin(&ui, width, height);
+
+        relay_poll();
 
         /*
             Window resized across a scale step:
@@ -1329,6 +1518,22 @@ int main(void)
                 event.button.button ==
                 SDL_BUTTON_LEFT)
             {
+                /* Pairing controls in the sidebar. */
+                if (g_relay_ok && sidebar.anim >= 0.85f) {
+                    SDL_Rect row = pair_row_rect(&ui);
+                    if (ui_point_in_rect(event.button.x,
+                                         event.button.y, row)) {
+                        g_pair_box = !g_pair_box;
+                    } else if (g_pair_box) {
+                        SDL_Rect nbr;
+                        pair_new_code_rect(&ui, &nbr);
+                        if (ui_point_in_rect(event.button.x,
+                                             event.button.y, nbr)) {
+                            relay_rotate_code();
+                        }
+                    }
+                }
+
                 int item =
                     sidebar_item_at(
                         &sidebar, &ui,
@@ -2018,6 +2223,13 @@ int main(void)
             boldFont, menuFont, dt);
 
         /*
+            Pairing button + code in the sidebar.
+        */
+        draw_pair_controls(
+            renderer, &ui, menuFont,
+            sidebar.anim);
+
+        /*
             Hamburger button.
         */
         hamburger_layout(
@@ -2184,6 +2396,7 @@ int main(void)
 
     deliver_ipc_reply("(Sayri closed.)");
     ipc_stop();
+    relay_stop();
     orb_free(&orb);
     ollama_shutdown();
 

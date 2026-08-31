@@ -27,6 +27,7 @@
 #include "downloads.h"
 #include "ollama.h"
 #include "history.h"
+#include "netpair.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -68,6 +69,18 @@ static float g_touch_last_y = 0.0f;
 
 /* IPC is disabled on Android */
 /* static int g_ipc_fd = -1; */
+
+/* Device-pairing sheet (connect to a desktop Sayri relay). */
+static bool g_pair_sheet = false;
+static bool g_pair_connecting = false;
+static char g_pair_host[NETPAIR_FIELD_LEN] = "";
+static char g_pair_port[16] = "5055";
+static char g_pair_code[NETPAIR_CODE_LEN + 1] = "";
+static int g_pair_focus = 0;   /* 0 host, 1 port, 2 code */
+static bool g_pair_port_touched = false;
+static bool g_pair_streamed_ready = false;
+static char g_pair_kbdigit = 0; /* digit inserted via SDL_KEYDOWN */
+static char g_pair_reply[NETPAIR_MAX_TEXT] = "";
 
 static UIColor lerp_color(UIColor a, UIColor b, float t)
 {
@@ -300,6 +313,20 @@ static void send_user_message(AppState *state, const char *text)
 {
     add_message(state, text, true);
     g_autoheal_attempts = 0;
+
+    /*
+        When paired with a desktop Sayri, stream the chat
+        through the desktop's local Ollama instead of
+        calling a remote/server directly.
+    */
+    NetpairStatus nst = netpair_status();
+    if (nst == NETPAIR_PAIRED) {
+        if (netpair_send_msg(text)) {
+            state->is_thinking = true;
+            return;
+        }
+    }
+
     dispatch_chat(state);
 }
 
@@ -312,6 +339,146 @@ static int sidebar_item_at(UISidebar *sb, UIContext *ui, int mx, int my)
                                SIDEBAR_ITEM_W, SIDEBAR_ITEM_H);
         if (ui_point_in_rect(mx, my, row)) return i;
     }
+    return -1;
+}
+
+/* Rect of the sidebar "Pair devices" button (below the menu items). */
+static SDL_Rect pair_row_rect_android(UIContext *ui)
+{
+    return ui_rect(ui, SIDEBAR_ITEM_X,
+                   SIDEBAR_ITEM_Y + SIDEBAR_ITEMS * SIDEBAR_ITEM_GAP + 14.0f,
+                   SIDEBAR_ITEM_W, SIDEBAR_ITEM_H + 8.0f);
+}
+
+/* Draw the sidebar "Pair devices" row. */
+static void draw_pair_row(SDL_Renderer *renderer, UIContext *ui,
+                          TTF_Font *font, float sidebar_anim)
+{
+    if (sidebar_anim < 0.8f) return;
+    float alpha = (sidebar_anim - 0.8f) / 0.2f;
+    if (alpha > 1.0f) alpha = 1.0f;
+    SDL_Rect row = pair_row_rect_android(ui);
+    int radius = (int)roundf(SIDEBAR_ITEM_H * 0.5f * ui->scale);
+    ui_glass(renderer, row, radius, g_pair_sheet, ui->dark);
+
+    NetpairStatus st = netpair_status();
+    const char *hint =
+        st == NETPAIR_PAIRED ? "Paired with computer"
+        : st == NETPAIR_CONNECTING ? "Connecting\u2026"
+        : "Pair with computer";
+    char label[96];
+    snprintf(label, sizeof(label), "Pair devices \u2014 %s", hint);
+    UIColor lc = ui_theme(ui->dark,
+        (UIColor){25, 55, 130, 255},
+        (UIColor){140, 190, 255, 255});
+    lc.a = (Uint8)(lc.a * alpha);
+    int fx = (int)roundf(13.0f * ui->scale);
+    ui_text(renderer, font, label,
+            row.x + fx,
+            row.y + (row.h - TTF_FontHeight(font)) / 2, lc);
+}
+
+/* Draw the pairing bottom sheet. */
+static void draw_pair_sheet(SDL_Renderer *renderer, UIContext *ui,
+                            TTF_Font *font, int width, int height)
+{
+    if (!g_pair_sheet) return;
+
+    /* Centered modal card (not bottom-anchored, so the
+       soft keyboard can't push it off-screen). */
+    float designW = (float)width / ui->scale;
+    const char *labels[3] = {"Host (e.g. 192.168.1.10)", "Port", "Pairing code"};
+    char *vals[3] = { g_pair_host, g_pair_port, g_pair_code };
+
+    float cw = 340.0f;
+    float ch = 360.0f;
+    float cx = (designW - cw) / 2.0f;
+    float cy = 100.0f;
+    float ix = cx + 20.0f;
+    float iw = cw - 40.0f;
+
+    SDL_Rect card = ui_rect(ui, cx, cy, cw, ch);
+    ui_fill_rounded_rect(renderer, card, (int)roundf(18.0f * ui->scale),
+        ui->dark ? (UIColor){28, 28, 32, 250} : (UIColor){244, 248, 254, 250});
+
+    /* Dim the rest of the app behind the card. */
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 140);
+    SDL_RenderFillRect(renderer, &(SDL_Rect){0, 0, width, height});
+
+    ui_text(renderer, font, "Connect to your computer",
+            card.x + (int)roundf(20.0f * ui->scale),
+            card.y + (int)roundf(20.0f * ui->scale),
+            ui_theme(ui->dark, (UIColor){30, 35, 60, 255}, (UIColor){220, 228, 245, 255}));
+
+    float fy = cy + 60.0f;
+    for (int i = 0; i < 3; i++) {
+        SDL_Rect field = ui_rect(ui, ix, fy, iw, 42.0f);
+        ui_fill_rounded_rect(renderer, field, (int)roundf(10.0f * ui->scale),
+            ui_theme(ui->dark,
+                (UIColor){230, 234, 244, 255}, (UIColor){60, 60, 68, 255}));
+        if (g_pair_focus == i) {
+            SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(renderer, 90, 120, 230, 220);
+            SDL_RenderDrawRect(renderer, &field);
+        }
+        UIColor fc = ui_theme(ui->dark,
+            (UIColor){30,35,60,255}, (UIColor){220,228,245,255});
+        if (vals[i][0])
+            ui_text(renderer, font, vals[i],
+                    field.x + (int)roundf(12.0f * ui->scale),
+                    field.y + (field.h - TTF_FontHeight(font)) / 2, fc);
+        else
+            ui_text(renderer, font, labels[i],
+                    field.x + (int)roundf(12.0f * ui->scale),
+                    field.y + (field.h - TTF_FontHeight(font)) / 2,
+                    ui_theme(ui->dark,
+                        (UIColor){150,150,165,200}, (UIColor){110,118,140,200}));
+        fy += 42.0f + 10.0f;
+    }
+
+    NetpairStatus st2 = netpair_status();
+    bool paired = (st2 == NETPAIR_PAIRED || st2 == NETPAIR_STREAMING);
+    SDL_Rect btn = ui_rect(ui, ix, fy, iw, 46.0f);
+    ui_fill_rounded_rect(renderer, btn, (int)roundf(12.0f * ui->scale),
+        paired ? (UIColor){90,80,120,255} : (UIColor){70,130,255,255});
+    ui_text_center(renderer, font, paired ? "Disconnect" : "Connect", btn,
+        (UIColor){255,255,255,255});
+
+    ui_text(renderer, font, netpair_status_text(),
+            card.x + (int)roundf(20.0f * ui->scale),
+            btn.y + btn.h + (int)roundf(12.0f * ui->scale),
+            ui_theme(ui->dark, (UIColor){90,100,120,220}, (UIColor){150,160,180,220}));
+
+    if (g_pair_reply[0]) {
+        char tmp[160];
+        snprintf(tmp, sizeof(tmp), "Sayri: %.70s", g_pair_reply);
+        ui_text(renderer, font, tmp,
+                card.x + (int)roundf(20.0f * ui->scale),
+                card.y + card.h - (int)roundf(30.0f * ui->scale),
+                ui_theme(ui->dark, (UIColor){90,100,120,220}, (UIColor){150,160,180,220}));
+    }
+}
+
+/* Field/button hit-testing, matching the centered modal layout in
+   draw_pair_sheet. Returns 0..2 for fields, 3 for the connect button,
+   -1 otherwise. */
+static int pair_field_at(UIContext *ui, int width, int height, int mx, int my)
+{
+    (void)height;
+    float designW = (float)width / ui->scale;
+    float cw = 340.0f;
+    float cx = (designW - cw) / 2.0f;
+    float cy = 100.0f;
+    float ix = cx + 20.0f;
+    float iw = cw - 40.0f;
+
+    for (int i = 0; i < 3; i++) {
+        SDL_Rect field = ui_rect(ui, ix, cy + 60.0f + i * 52.0f, iw, 42.0f);
+        if (ui_point_in_rect(mx, my, field)) return i;
+    }
+    SDL_Rect btn = ui_rect(ui, ix, cy + 60.0f + 3 * 52.0f, iw, 46.0f);
+    if (ui_point_in_rect(mx, my, btn)) return 3;
     return -1;
 }
 
@@ -796,7 +963,9 @@ int main(int argc, char *argv[])
 
                 /* On Android, handle back button */
                 if (event.key.keysym.sym == SDLK_AC_BACK) {
-                    if (sidebar.open) {
+                    if (g_pair_sheet) {
+                        g_pair_sheet = false;
+                    } else if (sidebar.open) {
                         sidebar.open = false;
                     } else if (settings.open) {
                         settings.open = false;
@@ -813,18 +982,76 @@ int main(int argc, char *argv[])
                 }
 
                 bool sb_focus = searchPopup.open && searchInput.focused;
+                bool sf_focus = g_pair_sheet && g_pair_focus >= 0 && g_pair_focus <= 2;
+                char *sf_val = sf_focus
+                    ? (g_pair_focus == 0 ? g_pair_host
+                       : g_pair_focus == 1 ? g_pair_port : g_pair_code)
+                    : NULL;
+                size_t sf_cap = sf_focus
+                    ? (g_pair_focus == 0 ? sizeof(g_pair_host)
+                       : g_pair_focus == 1 ? sizeof(g_pair_port)
+                       : sizeof(g_pair_code))
+                    : 0;
 
                 if (event.key.keysym.sym == SDLK_BACKSPACE &&
-                    !sb_focus && state.input_len > 0) {
+                    !sb_focus && !sf_focus && state.input_len > 0) {
                     state.input_len--;
                     state.input[state.input_len] = '\0';
+                }
+
+                if (sf_focus &&
+                    event.key.keysym.sym == SDLK_BACKSPACE &&
+                    strlen(sf_val) > 0) {
+                    size_t l = strlen(sf_val);
+                    while (l > 0 &&
+                           ((unsigned char)sf_val[l-1] & 0xC0) == 0x80)
+                        l--;
+                    if (l > 0) l--;
+                    sf_val[l] = '\0';
+                }
+
+                /* Android's on-screen numeric keyboard often delivers
+                   digits as SDL_KEYDOWN rather than SDL_TEXTINPUT.
+                   Insert digit keys ourselves so the pairing code (and
+                   port) always accept input beyond a couple of chars.
+                   The matching SDL_TEXTINPUT for the same digit is
+                   skipped via g_pair_kbdigit to avoid double entry. */
+                if (sf_focus &&
+                    event.key.keysym.sym >= SDLK_0 &&
+                    event.key.keysym.sym <= SDLK_9) {
+                    char d[2] = {
+                        (char)('0' + (event.key.keysym.sym - SDLK_0)), 0 };
+                    size_t len = strlen(sf_val);
+                    if (len + 1 < sf_cap) {
+                        sf_val[len] = d[0];
+                        sf_val[len + 1] = '\0';
+                        g_pair_kbdigit = d[0];
+                    }
+                }
+
+                if (sf_focus &&
+                    event.key.keysym.sym == SDLK_RETURN) {
+                    /* Tapping Enter in the sheet connects. */
+                    if (!g_pair_connecting) {
+                        NetpairStatus st = netpair_status();
+                        if (st == NETPAIR_PAIRED || st == NETPAIR_STREAMING) {
+                            netpair_disconnect();
+                        } else {
+                            netpair_set_endpoint(g_pair_host, g_pair_port);
+                            netpair_set_code(g_pair_code);
+                            g_pair_connecting = true;
+                            netpair_connect();
+                            g_pair_streamed_ready = true;
+                        }
+                    }
                 }
 
                 if (sb_focus)
                     searchbar_event(&searchInput, &event);
 
                 if (event.key.keysym.sym == SDLK_RETURN &&
-                    !sb_focus && state.input_len > 0 && !state.is_thinking) {
+                    !sb_focus && !sf_focus &&
+                    state.input_len > 0 && !state.is_thinking) {
                     char msg[INPUT_MAX];
                     snprintf(msg, sizeof(msg), "%s", state.input);
                     state.input[0] = '\0';
@@ -836,6 +1063,36 @@ int main(int argc, char *argv[])
             if (event.type == SDL_TEXTINPUT) {
                 if (searchPopup.open && searchInput.focused) {
                     searchbar_event(&searchInput, &event);
+                } else if (g_pair_sheet && g_pair_focus >= 0 && g_pair_focus <= 2) {
+                    char *f = g_pair_focus == 0 ? g_pair_host
+                             : g_pair_focus == 1 ? g_pair_port : g_pair_code;
+                    size_t cap = g_pair_focus == 0 ? sizeof(g_pair_host)
+                               : g_pair_focus == 1 ? sizeof(g_pair_port)
+                               : sizeof(g_pair_code);
+                    size_t len = strlen(f);
+                    const char *t = event.text.text;
+                    char buffered[INPUT_MAX];
+                    if (g_pair_focus == 1) {
+                        /* Port is numeric: drop anything that isn't a
+                           digit before inserting. */
+                        size_t di = 0;
+                        for (size_t si = 0; t[si] && si < sizeof(buffered) - 1; si++) {
+                            if (t[si] >= '0' && t[si] <= '9')
+                                buffered[di++] = t[si];
+                        }
+                        buffered[di] = '\0';
+                        t = buffered;
+                    }
+                    size_t add = strlen(t);
+                    if (g_pair_kbdigit &&
+                        add == 1 && t[0] == g_pair_kbdigit) {
+                        /* This digit was already inserted via
+                           SDL_KEYDOWN; ignore the duplicate. */
+                        g_pair_kbdigit = 0;
+                    } else if (len + add < cap) {
+                        memcpy(f + len, t, add);
+                        f[len + add] = '\0';
+                    }
                 } else {
                     int len = strlen(state.input);
                     int add = strlen(event.text.text);
@@ -853,6 +1110,57 @@ int main(int argc, char *argv[])
 
             if (event.type == SDL_MOUSEBUTTONDOWN &&
                 event.button.button == SDL_BUTTON_LEFT) {
+
+                /* Pairing sheet consumes taps while it is open. */
+                if (g_pair_sheet) {
+                    int f = pair_field_at(&ui, width, height,
+                                          event.button.x, event.button.y);
+                    if (f >= 0 && f <= 2) {
+                        g_pair_focus = f;
+                        /* Clear the prefilled default port on first focus
+                           so the user can type a fresh value. */
+                        if (f == 1 && !g_pair_port_touched) {
+                            g_pair_port_touched = true;
+                            g_pair_port[0] = '\0';
+                        }
+                    } else if (f == 3) {
+                        if (!g_pair_connecting) {
+                            NetpairStatus st = netpair_status();
+                            if (st == NETPAIR_PAIRED ||
+                                st == NETPAIR_STREAMING) {
+                                netpair_disconnect();
+                            } else {
+                                netpair_set_endpoint(g_pair_host, g_pair_port);
+                                netpair_set_code(g_pair_code);
+                                g_pair_connecting = true;
+                                netpair_connect();
+                                g_pair_streamed_ready = true;
+                            }
+                        }
+                    } else {
+                        g_pair_focus = -1;
+                    }
+                    state.input_focused = false;
+                    continue;
+                }
+
+                /* Sidebar pairing row toggles the sheet. */
+                if (sidebar.anim >= 0.85f) {
+                    SDL_Rect prow = pair_row_rect_android(&ui);
+                    if (ui_point_in_rect(event.button.x,
+                                         event.button.y, prow)) {
+                        g_pair_sheet = !g_pair_sheet;
+                        if (g_pair_sheet) {
+                            g_pair_focus = 0;
+                            g_pair_port_touched = false;
+                            g_pair_port[0] = '\0';
+                            snprintf(g_pair_port, sizeof(g_pair_port), "5055");
+                        }
+                        sidebar.open = false;
+                        continue;
+                    }
+                }
+
                 int item = sidebar_item_at(&sidebar, &ui,
                                            event.button.x, event.button.y);
                 if (item >= 0) {
@@ -997,7 +1305,8 @@ int main(int argc, char *argv[])
             editing: the main prompt or the search box.
         */
         bool want_kb = state.input_focused ||
-                       (searchPopup.open && searchInput.focused);
+                       (searchPopup.open && searchInput.focused) ||
+                       (g_pair_sheet && g_pair_focus >= 0 && g_pair_focus <= 2);
         if (want_kb && !g_kb_shown) {
             SDL_StartTextInput();
             g_kb_shown = true;
@@ -1101,6 +1410,26 @@ int main(int argc, char *argv[])
 
         /* IPC disabled on Android */
 
+        /* Stream assistant replies arriving from a paired computer. */
+        {
+            char buf[NETPAIR_MAX_TEXT];
+            bool nd = false;
+            bool finished = netpair_poll(buf, sizeof(buf), &nd);
+            if (finished) {
+                state.is_thinking = false;
+                g_pair_connecting = false;
+                if (buf[0]) {
+                    add_message(&state, buf, false);
+                    g_pair_reply[0] = '\0';
+                }
+            }
+            if (nd) {
+                snprintf(g_pair_reply, sizeof(g_pair_reply), "%s", buf);
+            }
+            if (netpair_status() == NETPAIR_IDLE)
+                g_pair_connecting = false;
+        }
+
         OllamaReply reply;
         ollama_poll(&reply);
         if (reply.done) {
@@ -1155,6 +1484,9 @@ int main(int argc, char *argv[])
 
         sidebar_layout(&sidebar, &ui, 0, 0, 300, height / ui.scale);
         sidebar_draw(&sidebar, &ui, renderer, boldFont, menuFont, dt);
+
+        /* Pair devices button in the sidebar (with the panel). */
+        draw_pair_row(renderer, &ui, smallFont, sidebar.anim);
 
         hamburger_layout(&hamburger, &ui, 15, 15, 44);
         hamburger_draw(&hamburger, &ui, renderer);
@@ -1217,12 +1549,16 @@ int main(int argc, char *argv[])
                          sheetMargin, 64.0f, sheetW, DL_DEFAULT_H);
         downloads_draw(&dlPanel, &ui, renderer, font, boldFont, dt);
 
+        /* Pairing sheet is topmost, drawn last. */
+        draw_pair_sheet(renderer, &ui, smallFont, width, height);
+
         SDL_RenderPresent(renderer);
     }
 
     persist_session(&state);
     if (rt) SDL_DestroyTexture(rt);
     orb_free(&orb);
+    netpair_disconnect();
     ollama_shutdown();
     close_fonts(&fonts);
     SDL_DestroyRenderer(renderer);

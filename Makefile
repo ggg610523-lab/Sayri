@@ -43,7 +43,8 @@ SOURCES = \
     history.c \
     downloads.c \
     ollama.c \
-    ipc.c
+    ipc.c \
+    relay.c
 
 OBJECTS = $(SOURCES:.c=.o)
 

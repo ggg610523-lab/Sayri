@@ -43,6 +43,7 @@ set(APP_SOURCES
     history_android.c
     downloads.c
     ollama_android.c
+    netpair_android.c
     ipc_android.c
 )
 
