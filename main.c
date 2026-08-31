@@ -27,6 +27,7 @@
 #include "history.h"
 #include "ipc.h"
 #include "relay.h"
+#include "qrsurface.h"
 #include <time.h>
 
 #ifndef M_PI
@@ -595,10 +596,15 @@ static void draw_pair_controls(
 
     ui_glass(renderer, row, radius, g_pair_box, ui->dark);
 
+    int nConnected = relay_paired_count();
     char label[96];
-    snprintf(label, sizeof(label),
-             "Pair devices \u2014 code %s",
-             g_pair_code);
+    if (nConnected > 0)
+        snprintf(label, sizeof(label),
+                 "Pair devices (%d)",
+                 nConnected);
+    else
+        snprintf(label, sizeof(label),
+                 "Pair devices");
 
     UIColor lc = ui_theme(ui->dark,
         (UIColor){25, 55, 130, 255},
@@ -612,12 +618,13 @@ static void draw_pair_controls(
     if (!g_pair_box)
         return;
 
-    /* Expanded panel below the button. */
+    /* Expanded panel below the button. Shows the scan-ready
+       QR code up top, then IP/port + code beneath it. */
     SDL_Rect panel = {
         row.x,
         row.y + row.h + (int)roundf(8.0f * ui->scale),
         row.w,
-        (int)roundf(122.0f * ui->scale)
+        (int)roundf(288.0f * ui->scale)
     };
     ui_glass(renderer, panel, (int)roundf(14.0f * ui->scale),
              false, ui->dark);
@@ -625,59 +632,66 @@ static void draw_pair_controls(
     char ip[64] = "";
     bool have_ip = lan_ipv4(ip, sizeof(ip));
 
+    /* Encode the pairing URI: sayri://<ip>:<port>?code=<code>
+       The Android app scans this and auto-connects. */
+    char uri[192];
+    snprintf(uri, sizeof(uri), "sayri://%s:%d?code=%s",
+             have_ip ? ip : "?.?.?.?", RELAY_PORT, g_pair_code);
+    qrsurface_set(uri);
+
+    int qrPx = (int)roundf(184.0f * ui->scale);
+    qrsurface_draw(renderer,
+        panel.x + (panel.w - qrPx) / 2,
+        panel.y + (int)roundf(10.0f * ui->scale),
+        qrPx,
+        (UIColor){25, 28, 40, 255},
+        (UIColor){250, 252, 255, 255});
+
     char line[128];
-    snprintf(line, sizeof(line),
-             "Connect from your phone:");
+    snprintf(line, sizeof(line), "Scan with Sayri:");
     ui_text(renderer, font, line,
             panel.x + (int)roundf(14.0f * ui->scale),
-            panel.y + (int)roundf(12.0f * ui->scale),
+            panel.y + (int)roundf(204.0f * ui->scale),
             ui_theme(ui->dark,
                      (UIColor){80, 90, 110, 230},
                      (UIColor){150, 158, 178, 230}));
 
     char addr_line[160];
     snprintf(addr_line, sizeof(addr_line),
-             "IP %s:%d", have_ip ? ip : "?.?.?.?", RELAY_PORT);
+             "IP %s:%d",
+             have_ip ? ip : "?.?.?.?", RELAY_PORT);
     ui_text(renderer, font, addr_line,
             panel.x + (int)roundf(14.0f * ui->scale),
-            panel.y + (int)roundf(32.0f * ui->scale),
+            panel.y + (int)roundf(224.0f * ui->scale),
             ui_theme(ui->dark,
                      (UIColor){30, 40, 58, 255},
                      (UIColor){205, 205, 212, 255}));
 
     char code_line[128];
     snprintf(code_line, sizeof(code_line),
-             "Pairing code %s", g_pair_code);
+             "Code %s", g_pair_code);
     ui_text(renderer, font, code_line,
             panel.x + (int)roundf(14.0f * ui->scale),
-            panel.y + (int)roundf(52.0f * ui->scale),
+            panel.y + (int)roundf(244.0f * ui->scale),
             ui_theme(ui->dark,
                      (UIColor){30, 40, 58, 255},
                      (UIColor){205, 205, 212, 255}));
 
-    SDL_Rect newbtn = {
-        panel.x + (int)roundf(12.0f * ui->scale),
-        panel.y + (int)roundf(78.0f * ui->scale),
-        (int)roundf(90.0f * ui->scale),
-        (int)roundf(28.0f * ui->scale)
-    };
-    ui_glass(renderer, newbtn,
-             (int)roundf(14.0f * ui->scale),
-             false, ui->dark);
-    ui_text_center(renderer, font, "New code", newbtn,
-        ui_theme(ui->dark,
-                 (UIColor){25, 55, 130, 255},
-                 (UIColor){150, 210, 255, 255}));
-}
-
-static bool pair_new_code_rect(UIContext *ui, SDL_Rect *out)
-{
-    SDL_Rect row = pair_row_rect(ui);
-    out->x = row.x + (int)roundf(12.0f * ui->scale);
-    out->y = row.y + row.h + (int)roundf(86.0f * ui->scale);
-    out->w = (int)roundf(90.0f * ui->scale);
-    out->h = (int)roundf(28.0f * ui->scale);
-    return true;
+    char state_line[128];
+    if (nConnected > 0)
+        snprintf(state_line, sizeof(state_line),
+                 "%d device(s) linked", nConnected);
+    else
+        snprintf(state_line, sizeof(state_line),
+                 "Scan to pair.");
+    UIColor stc = ui_theme(ui->dark,
+        nConnected > 0 ? (UIColor){20, 120, 70, 220}
+                       : (UIColor){80, 90, 110, 200},
+        nConnected > 0 ? (UIColor){120, 220, 160, 220}
+                       : (UIColor){160, 168, 185, 200});
+    ui_text(renderer, font, state_line,
+            panel.x + (int)roundf(14.0f * ui->scale),
+            panel.y + (int)roundf(264.0f * ui->scale), stc);
 }
 
 /*
@@ -1525,12 +1539,7 @@ int main(void)
                                          event.button.y, row)) {
                         g_pair_box = !g_pair_box;
                     } else if (g_pair_box) {
-                        SDL_Rect nbr;
-                        pair_new_code_rect(&ui, &nbr);
-                        if (ui_point_in_rect(event.button.x,
-                                             event.button.y, nbr)) {
-                            relay_rotate_code();
-                        }
+                        /* Clicking elsewhere in the sidebar keeps it open. */
                     }
                 }
 

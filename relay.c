@@ -78,7 +78,9 @@ static int send_line(int fd, const char *fmt, const char *arg)
     else
         n = snprintf(buf, sizeof(buf), "%s", fmt);
     if (n < 0) return -1;
-    if (n > (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
+    if (n > (int)sizeof(buf) - 2) n = (int)sizeof(buf) - 2;
+    /* The wire protocol is newline-framed; readers break on '\n'. */
+    buf[n++] = '\n';
     return sock_send(fd, buf, (size_t)n);
 }
 
@@ -143,6 +145,29 @@ static void client_remove(int fd)
         }
     }
     SDL_UnlockMutex(g_relay.lock);
+}
+
+static void client_mark_paired(int fd)
+{
+    SDL_LockMutex(g_relay.lock);
+    for (int i = 0; i < RELAY_MAX_CLIENTS; i++)
+        if (g_relay.clients[i].fd == fd) {
+            g_relay.clients[i].paired = true;
+            break;
+        }
+    SDL_UnlockMutex(g_relay.lock);
+}
+
+int relay_paired_count(void)
+{
+    int c = 0;
+    if (!g_relay.lock) return 0;
+    SDL_LockMutex(g_relay.lock);
+    for (int i = 0; i < RELAY_MAX_CLIENTS; i++)
+        if (g_relay.clients[i].fd && g_relay.clients[i].paired)
+            c++;
+    SDL_UnlockMutex(g_relay.lock);
+    return c;
 }
 
 /* ---------------- current pairing code ---------------- */
@@ -247,6 +272,7 @@ static int conn_thread(void *data)
                 if (!strcmp(line + 5, code)) {
                     paired = true;
                     send_cmd(fd, "PAIR OK");
+                    client_mark_paired(fd);
                 } else {
                     send_cmd(fd, "PAIR ERR Wrong pairing code");
                 }

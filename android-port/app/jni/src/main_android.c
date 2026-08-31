@@ -18,6 +18,11 @@
 #include <stdlib.h>
 #include <time.h>
 
+#ifdef ANDROID
+#include <jni.h>
+#include <SDL2/SDL_system.h>
+#endif
+
 #include "ui.h"
 #include "hamburger.h"
 #include "sidebar.h"
@@ -81,6 +86,108 @@ static bool g_pair_port_touched = false;
 static bool g_pair_streamed_ready = false;
 static char g_pair_kbdigit = 0; /* digit inserted via SDL_KEYDOWN */
 static char g_pair_reply[NETPAIR_MAX_TEXT] = "";
+
+#ifdef ANDROID
+/*
+    Parse a scanned pairing URI:
+        sayri://<host>:<port>?code=<code>
+    Returns true and fills host/port/code on success.
+*/
+static bool parse_pair_uri(const char *uri, char *host, size_t host_cap,
+                           char *port, size_t port_cap,
+                           char *code, size_t code_cap)
+{
+    if (!uri || strncmp(uri, "sayri://", 8) != 0) return false;
+    const char *p = uri + 8;
+    const char *colon = strchr(p, ':');
+    const char *q = strchr(p, '?');
+    if (!colon || !q || colon > q) return false;
+
+    size_t host_len = (size_t)(colon - p);
+    if (host_len == 0 || host_len >= host_cap) return false;
+    memcpy(host, p, host_len);
+    host[host_len] = '\0';
+
+    size_t port_len = (size_t)(q - colon) - 1;
+    if (port_len == 0 || port_len >= port_cap) return false;
+    memcpy(port, colon + 1, port_len);
+    port[port_len] = '\0';
+
+    const char *k = strstr(q + 1, "code=");
+    if (!k) return false;
+    const char *c = k + 5;
+    size_t code_len = strlen(c);
+    if (code_len == 0 || code_len >= code_cap) return false;
+    memcpy(code, c, code_len);
+    code[code_len] = '\0';
+    return true;
+}
+
+/* Launch the Java QR scanner activity. */
+static void android_launch_scanner(void)
+{
+    JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+    if (!env) return;
+    jobject activity = (jobject)SDL_AndroidGetActivity();
+    jclass bridge = (*env)->FindClass(env,
+                                     "com/sayri/assistant/SayriBridge");
+    if (!bridge) {
+        if (activity) (*env)->DeleteLocalRef(env, activity);
+        return;
+    }
+    jmethodID launch = (*env)->GetStaticMethodID(env, bridge,
+        "launchScanner", "(Landroid/content/Context;)V");
+    if (launch && activity)
+        (*env)->CallStaticVoidMethod(env, bridge, launch, activity);
+    (*env)->DeleteLocalRef(env, bridge);
+    if (activity) (*env)->DeleteLocalRef(env, activity);
+}
+
+/*
+    Poll the bridge for a scanned URI. When one lands, fill the
+    pairing sheet and auto-connect. Call every frame while the
+    pairing sheet is open.
+*/
+static void android_apply_scanned_qr(void)
+{
+    JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+    if (!env || !g_pair_sheet) return;
+    jclass bridge = (*env)->FindClass(env,
+                                     "com/sayri/assistant/SayriBridge");
+    if (!bridge) return;
+    jmethodID take = (*env)->GetStaticMethodID(env, bridge,
+        "takeScannedUri", "()Ljava/lang/String;");
+    if (!take) {
+        (*env)->DeleteLocalRef(env, bridge);
+        return;
+    }
+    jstring js = (jstring)(*env)->CallStaticObjectMethod(env, bridge, take);
+    (*env)->DeleteLocalRef(env, bridge);
+    if (!js) return;
+
+    const char *uri = (*env)->GetStringUTFChars(env, js, NULL);
+    if (uri) {
+        char host[NETPAIR_FIELD_LEN];
+        char port[NETPAIR_FIELD_LEN];
+        char code[NETPAIR_CODE_LEN + 1];
+        if (parse_pair_uri(uri, host, sizeof(host),
+                           port, sizeof(port), code, sizeof(code))) {
+            snprintf(g_pair_host, sizeof(g_pair_host), "%s", host);
+            snprintf(g_pair_port, sizeof(g_pair_port), "%s", port);
+            snprintf(g_pair_code, sizeof(g_pair_code), "%s", code);
+            if (!g_pair_connecting) {
+                netpair_set_endpoint(g_pair_host, g_pair_port);
+                netpair_set_code(g_pair_code);
+                g_pair_connecting = true;
+                netpair_connect();
+                g_pair_streamed_ready = true;
+            }
+        }
+        (*env)->ReleaseStringUTFChars(env, js, uri);
+    }
+    (*env)->DeleteLocalRef(env, js);
+}
+#endif
 
 static UIColor lerp_color(UIColor a, UIColor b, float t)
 {
@@ -350,6 +457,19 @@ static SDL_Rect pair_row_rect_android(UIContext *ui)
                    SIDEBAR_ITEM_W, SIDEBAR_ITEM_H + 8.0f);
 }
 
+/* Rect of the "Scan QR code instead" button inside the pairing
+   modal (below the Connect button). */
+static SDL_Rect pair_scan_rect_android(UIContext *ui)
+{
+    float designW = (float)ui->window_w / ui->scale;
+    float cw = 340.0f;
+    float cx = (designW - cw) / 2.0f;
+    float ix = cx + 20.0f;
+    float iw = cw - 40.0f;
+    float connectTop = 100.0f + 60.0f + 3 * 52.0f;
+    return ui_rect(ui, ix, connectTop + 46.0f + 12.0f, iw, 46.0f);
+}
+
 /* Draw the sidebar "Pair devices" row. */
 static void draw_pair_row(SDL_Renderer *renderer, UIContext *ui,
                           TTF_Font *font, float sidebar_anim)
@@ -363,9 +483,10 @@ static void draw_pair_row(SDL_Renderer *renderer, UIContext *ui,
 
     NetpairStatus st = netpair_status();
     const char *hint =
-        st == NETPAIR_PAIRED ? "Paired with computer"
-        : st == NETPAIR_CONNECTING ? "Connecting\u2026"
-        : "Pair with computer";
+        st == NETPAIR_PAIRED ? "Paired"
+        : st == NETPAIR_CONNECTING ? "Connecting"
+        : st == NETPAIR_NEED_CODE ? "Enter code"
+        : "Tap to pair";
     char label[96];
     snprintf(label, sizeof(label), "Pair devices \u2014 %s", hint);
     UIColor lc = ui_theme(ui->dark,
@@ -445,9 +566,16 @@ static void draw_pair_sheet(SDL_Renderer *renderer, UIContext *ui,
     ui_text_center(renderer, font, paired ? "Disconnect" : "Connect", btn,
         (UIColor){255,255,255,255});
 
+    /* Scan QR button — launches the Java camera scanner. */
+    SDL_Rect scan = pair_scan_rect_android(ui);
+    ui_fill_rounded_rect(renderer, scan, (int)roundf(12.0f * ui->scale),
+        (UIColor){30, 90, 210, 255});
+    ui_text_center(renderer, font, "Scan QR code instead", scan,
+        (UIColor){255,255,255,255});
+
     ui_text(renderer, font, netpair_status_text(),
             card.x + (int)roundf(20.0f * ui->scale),
-            btn.y + btn.h + (int)roundf(12.0f * ui->scale),
+            scan.y + scan.h + (int)roundf(12.0f * ui->scale),
             ui_theme(ui->dark, (UIColor){90,100,120,220}, (UIColor){150,160,180,220}));
 
     if (g_pair_reply[0]) {
@@ -460,9 +588,9 @@ static void draw_pair_sheet(SDL_Renderer *renderer, UIContext *ui,
     }
 }
 
-/* Field/button hit-testing, matching the centered modal layout in
+/* Hit-testing for the pairing modal, matching the centered layout in
    draw_pair_sheet. Returns 0..2 for fields, 3 for the connect button,
-   -1 otherwise. */
+   4 for the Scan QR button, -1 otherwise. */
 static int pair_field_at(UIContext *ui, int width, int height, int mx, int my)
 {
     (void)height;
@@ -479,6 +607,9 @@ static int pair_field_at(UIContext *ui, int width, int height, int mx, int my)
     }
     SDL_Rect btn = ui_rect(ui, ix, cy + 60.0f + 3 * 52.0f, iw, 46.0f);
     if (ui_point_in_rect(mx, my, btn)) return 3;
+
+    SDL_Rect scan = pair_scan_rect_android(ui);
+    if (ui_point_in_rect(mx, my, scan)) return 4;
     return -1;
 }
 
@@ -1137,6 +1268,11 @@ int main(int argc, char *argv[])
                                 g_pair_streamed_ready = true;
                             }
                         }
+                    } else if (f == 4) {
+#ifdef ANDROID
+                        android_launch_scanner();
+#endif
+                        g_pair_focus = -1;
                     } else {
                         g_pair_focus = -1;
                     }
@@ -1430,6 +1566,11 @@ int main(int argc, char *argv[])
                 g_pair_connecting = false;
         }
 
+#ifdef ANDROID
+        /* If the user scanned a QR, auto-fill the pairing sheet. */
+        android_apply_scanned_qr();
+#endif
+
         OllamaReply reply;
         ollama_poll(&reply);
         if (reply.done) {
@@ -1497,9 +1638,13 @@ int main(int argc, char *argv[])
 
         orb_grow += ((state.is_thinking ? 1.0f : 0.0f) - orb_grow) * 5.0f * dt;
         int chatW = width - sbPx - pad * 2;
-        float orbSizeF = (float)chatW * 0.24f * (1.0f + 0.10f * orb_grow);
-        if (orbSizeF > height * 0.30f) orbSizeF = height * 0.30f;
-        if (orbSizeF > 240.0f) orbSizeF = 240.0f;
+        /* On a portrait phone the orb was 24% of the chat width and capped
+           at 240px, which read as a small dot. Base it on both dimensions
+           and let it grow much larger. */
+        float orbBase = fminf((float)chatW, (float)chatH);
+        float orbSizeF = orbBase * 0.42f * (1.0f + 0.10f * orb_grow);
+        if (orbSizeF > height * 0.46f) orbSizeF = height * 0.46f;
+        if (orbSizeF > 360.0f) orbSizeF = 360.0f;
 
         SDL_Rect orbRect = {
             sbPx + pad + (chatW - (int)orbSizeF) / 2,

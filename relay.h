@@ -59,6 +59,13 @@ void relay_code(char *out, size_t out_size);
 void relay_rotate_code(void);
 
 /*
+    Number of devices currently paired and connected to the
+    relay (i.e. an active phone/tablet streaming through this
+    desktop). Used by the UI to indicate a live connection.
+*/
+int relay_paired_count(void);
+
+/*
     Stop the listener and join all worker threads.
 */
 void relay_stop(void);

@@ -44,7 +44,9 @@ SOURCES = \
     downloads.c \
     ollama.c \
     ipc.c \
-    relay.c
+    relay.c \
+    qrsurface.c \
+    qrcodegen.c
 
 OBJECTS = $(SOURCES:.c=.o)
 

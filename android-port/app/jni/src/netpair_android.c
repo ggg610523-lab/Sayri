@@ -105,8 +105,13 @@ static int send_cmd(const char *fmt, const char *arg)
 }
 
 /*
-    Read one newline-terminated line. Returns length,
-    0 on EOF, -1 on error.
+    Read one newline-terminated line. Returns:
+        length (>0)  a complete line (excluding '\n')
+        0            clean EOF (peer closed)
+        -1           hard error
+        -2           receive time-out with no data pending —
+                     the caller should keep waiting, the peer
+                     is still connected (SO_RCVTIMEO fired).
 */
 static int read_line(char *out, size_t cap)
 {
@@ -122,7 +127,8 @@ static int read_line(char *out, size_t cap)
             break;
         } else {
             if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return n > 0 ? (int)n : -2;
             return -1;
         }
     }
@@ -191,14 +197,16 @@ static int connection_run(void)
     char line[NETPAIR_MAX_TEXT];
 
     /* Expect HELLO with the current desktop code. */
-    {
+    for (;;) {
         int n = read_line(line, sizeof(line));
+        if (n == -2) continue;               /* no data yet, keep waiting */
         if (n <= 0 || strncmp(line, "HELLO ", 6)) {
             close(fd);
             g.fd = -1;
             set_status(NETPAIR_IDLE, "Computer did not respond");
             return 1;
         }
+        break;
     }
 
     /* Send PAIR with the user-entered code. */
@@ -213,6 +221,7 @@ static int connection_run(void)
     /* Wait for PAIR OK / PAIR ERR. */
     for (;;) {
         int n = read_line(line, sizeof(line));
+        if (n == -2) continue;               /* no data yet, keep waiting */
         if (n <= 0) {
             close(fd);
             g.fd = -1;
@@ -233,6 +242,7 @@ static int connection_run(void)
     /* Streaming loop: read TOK / DONE frames. */
     while (g.running) {
         int n = read_line(line, sizeof(line));
+        if (n == -2) continue;   /* idle; peer still there — stay paired */
         if (n <= 0) {
             close(fd);
             g.fd = -1;

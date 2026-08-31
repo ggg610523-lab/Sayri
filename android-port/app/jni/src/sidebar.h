@@ -7,12 +7,15 @@
 
 /*
     Item row geometry (design pixels).
+
+    Sized up from the desktop values (210x32, gap 38) so
+    the rows are comfortable touch targets on a phone.
 */
 #define SIDEBAR_ITEM_X    15.0f
-#define SIDEBAR_ITEM_Y    56.0f
-#define SIDEBAR_ITEM_W    210.0f
-#define SIDEBAR_ITEM_H    32.0f
-#define SIDEBAR_ITEM_GAP  38.0f
+#define SIDEBAR_ITEM_Y    64.0f
+#define SIDEBAR_ITEM_W    245.0f
+#define SIDEBAR_ITEM_H    44.0f
+#define SIDEBAR_ITEM_GAP  54.0f
 
 typedef struct {
     SDL_Rect rect;
