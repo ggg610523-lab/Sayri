@@ -1,2 +1,5 @@
 history/
 *.chat
+# Stray backups and compiled test binaries
+backup/
+tests/tcancel
