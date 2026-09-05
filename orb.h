@@ -10,11 +10,11 @@ typedef struct {
     SDL_Texture *texture;
     Uint32 pixels[ORB_RES * ORB_RES];
     float time;
-    float audio;
     bool dirty;
     bool visible;
     float dx, dy, dw, dh;
     SDL_Rect rect;
+    void *fallback;
 } Orb;
 
 void orb_init(

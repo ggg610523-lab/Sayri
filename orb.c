@@ -1,298 +1,574 @@
 #include "orb.h"
+#include "orb1.h"
 #include <math.h>
 #include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <time.h>
+#include <SDL2/SDL_opengl.h>
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
+/*
+    ============================================================
+    GL orb: the Siri-style shader orb from test/orb.c, vendored
+    here so the running app uses it instead of the software
+    renderer above.
 
-static float clampf(float v, float lo, float hi)
+    Geometry: a hidden ORB_RES window with its own GL 3.2 core
+    context renders the full-screen-triangle fragment shader
+    into its default framebuffer; we glReadPixels the result
+    and upload it to the same streaming SDL texture the old
+    orb used. If any GL step fails we fall back to the CPU
+    renderer, so the app never breaks.
+    ============================================================
+*/
+
+#define ORB_BIND(ret, name, ...) \
+    typedef ret (*orb_gl_##name##_fn)(__VA_ARGS__); \
+    static orb_gl_##name##_fn orb_gl_##name;
+
+ORB_BIND(void, UseProgram, GLuint)
+ORB_BIND(void, Uniform1f, GLint, GLfloat)
+ORB_BIND(void, Uniform2f, GLint, GLfloat, GLfloat)
+ORB_BIND(void, Uniform3f, GLint, GLfloat, GLfloat, GLfloat)
+ORB_BIND(void, Uniform4f, GLint, GLfloat, GLfloat, GLfloat, GLfloat)
+ORB_BIND(GLint, GetUniformLocation, GLuint, const char *)
+ORB_BIND(void, Viewport, GLint, GLint, GLsizei, GLsizei)
+ORB_BIND(void, DrawArrays, GLenum, GLint, GLsizei)
+ORB_BIND(void, Enable, GLenum)
+ORB_BIND(void, Disable, GLenum)
+ORB_BIND(void, BlendFunc, GLenum, GLenum)
+ORB_BIND(void, ClearColor, GLfloat, GLfloat, GLfloat, GLfloat)
+ORB_BIND(void, Clear, unsigned int)
+ORB_BIND(void, GenVertexArrays, GLsizei, GLuint *)
+ORB_BIND(void, BindVertexArray, GLuint)
+ORB_BIND(void, DeleteVertexArrays, GLsizei, const GLuint *)
+ORB_BIND(GLuint, CreateShader, GLenum)
+ORB_BIND(void, ShaderSource, GLuint, GLsizei, const char *const *, const GLint *)
+ORB_BIND(void, CompileShader, GLuint)
+ORB_BIND(void, GetShaderiv, GLuint, GLenum, GLint *)
+ORB_BIND(void, GetShaderInfoLog, GLuint, GLsizei, GLsizei *, char *)
+ORB_BIND(void, DeleteShader, GLuint)
+ORB_BIND(GLuint, CreateProgram, void)
+ORB_BIND(void, AttachShader, GLuint, GLuint)
+ORB_BIND(void, LinkProgram, GLuint)
+ORB_BIND(void, GetProgramiv, GLuint, GLenum, GLint *)
+ORB_BIND(void, GetProgramInfoLog, GLuint, GLsizei, GLsizei *, char *)
+ORB_BIND(void, DeleteProgram, GLuint)
+ORB_BIND(void, ReadPixels, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *)
+
+#undef ORB_BIND
+
+static SDL_Window *orb_gl_win = NULL;
+static SDL_GLContext orb_gl_ctx = NULL;
+static GLuint orb_gl_vao = 0;
+static GLuint orb_gl_prog = 0;
+static GLint orb_gl_loc_viewport = -1;
+static GLint orb_gl_loc_resolution = -1;
+static GLint orb_gl_loc_time = -1;
+static GLint orb_gl_loc_primary = -1;
+static GLint orb_gl_loc_secondary = -1;
+static GLint orb_gl_loc_noise = -1;
+static GLint orb_gl_loc_glow = -1;
+static GLint orb_gl_loc_sat = -1;
+static GLint orb_gl_loc_bright = -1;
+static GLint orb_gl_loc_rot = -1;
+static GLint orb_gl_loc_nscale = -1;
+static GLint orb_gl_loc_core = -1;
+static GLint orb_gl_loc_edge = -1;
+static float orb_gl_primary_c[3];
+static float orb_gl_secondary_c[3];
+static unsigned char *orb_gl_read = NULL;
+static int orb_gl_ok = 0;
+
+static const char *ORB_GL_VS =
+    "#version 150\n"
+    "void main() {\n"
+    "  vec2 p;\n"
+    "  if (gl_VertexID == 0) p = vec2(-1.0, -1.0);\n"
+    "  else if (gl_VertexID == 1) p = vec2(3.0, -1.0);\n"
+    "  else p = vec2(-1.0, 3.0);\n"
+    "  gl_Position = vec4(p, 0.0, 1.0);\n"
+    "}\n";
+
+static const char *ORB_GL_FS =
+    "#version 150\n"
+    "uniform vec2 u_resolution;\n"
+    "uniform vec4 u_viewport;\n"
+    "uniform float u_time;\n"
+    "uniform vec3 u_primary;\n"
+    "uniform vec3 u_secondary;\n"
+    "uniform float u_noiseIntensity;\n"
+    "uniform float u_glowIntensity;\n"
+    "uniform float u_saturation;\n"
+    "uniform float u_brightness;\n"
+    "uniform float u_rotationSpeed;\n"
+    "uniform float u_noiseScale;\n"
+    "uniform float u_coreIntensity;\n"
+    "uniform float u_edgeSoftness;\n"
+    "out vec4 fragColor;\n"
+    "const float TAU = 6.28318530718;\n"
+    "float rand(vec2 n) { return fract(sin(dot(n, vec2(12.9898, 4.1414))) * "
+    "43758.5453); }\n"
+    "float noise(vec2 p) {\n"
+    "  vec2 ip = floor(p);\n"
+    "  vec2 fp = fract(p);\n"
+    "  fp = fp * fp * (3.0 - 2.0 * fp);\n"
+    "  float res = mix(\n"
+    "    mix(rand(ip), rand(ip + vec2(1.0, 0.0)), fp.x),\n"
+    "    mix(rand(ip + vec2(0.0, 1.0)), rand(ip + vec2(1.0, 1.0)), fp.x),\n"
+    "    fp.y\n"
+    "  );\n"
+    "  return res * res;\n"
+    "}\n"
+    "float fbm(vec2 p, int octaves) {\n"
+    "  float s = 0.0;\n"
+    "  float m = 0.0;\n"
+    "  float a = 0.5;\n"
+    "  for (int i = 0; i < 4; i++) {\n"
+    "    if (i >= octaves) break;\n"
+    "    s += a * noise(p);\n"
+    "    m += a;\n"
+    "    a *= 0.5;\n"
+    "    p *= 2.0;\n"
+    "  }\n"
+    "  return s / m;\n"
+    "}\n"
+    "vec3 pal(float t, vec3 a, vec3 b, vec3 c, vec3 d) {\n"
+    "  return a + b * cos(TAU * (c * t + d));\n"
+    "}\n"
+    "float luma(vec3 color) { return dot(color, vec3(0.299, 0.587, 0.114)); }\n"
+    "void main() {\n"
+    "  vec2 local = gl_FragCoord.xy - u_viewport.xy;\n"
+    "  float min_res = min(u_resolution.x, u_resolution.y);\n"
+    "  vec2 uv = (local * 2.0 - u_resolution.xy) / min_res * 1.5;\n"
+    "  float t = u_time;\n"
+    "  float l = dot(uv, uv);\n"
+    "  float edgeOuter = 1.0 + u_edgeSoftness;\n"
+    "  float edgeInner = 1.0 - u_edgeSoftness;\n"
+    "  float sm = smoothstep(edgeOuter, edgeInner, l);\n"
+    "  if (sm <= 0.0) { fragColor = vec4(0.0, 0.0, 0.0, 0.0); return; }\n"
+    "  float d = sm * l * l * l * 2.0;\n"
+    "  vec3 norm = normalize(vec3(uv.x, uv.y, 0.7 - d));\n"
+    "  float nx = fbm(uv * 2.0 * u_noiseIntensity + t * 0.4 + 25.69, 4);\n"
+    "  float ny = fbm(uv * 2.0 * u_noiseIntensity + t * 0.4 + 86.31, 4);\n"
+    "  float n = fbm(uv * u_noiseScale + 2.0 * vec2(nx, ny), 3);\n"
+    "  vec3 col = vec3(n * 0.5 + 0.25);\n"
+    "  float a = atan(uv.y, uv.x) / TAU + t * 0.1 * u_rotationSpeed;\n"
+    "  vec3 palA = mix(vec3(0.3), u_primary * 0.5, 0.5);\n"
+    "  vec3 palD = mix(vec3(0.0, 0.8, 0.8), u_secondary, 0.7);\n"
+    "  col *= pal(a, palA, vec3(0.5, 0.5, 0.5), vec3(1.0), palD);\n"
+    "  col *= u_saturation;\n"
+    "  vec3 cd = abs(col);\n"
+    "  vec3 c = col * d;\n"
+    "  c += (c * 0.5 + vec3(1.0) - luma(c)) * vec3(max(0.0, pow(dot(norm, "
+    "vec3(0.0, 0.0, -1.0)), 5.0) * 3.0));\n"
+    "  float g = u_glowIntensity * smoothstep(0.6, 1.0, fbm(norm.xy * 3.0 / "
+    "(1.0 + norm.z), 2)) * d;\n"
+    "  c += g;\n"
+    "  col = c + col * pow((1.0 - smoothstep(1.0, 0.98, l) - "
+    "pow(max(0.0, length(uv) - 1.0), 0.2)) * 2.0, 4.0);\n"
+    "  float f = fbm(normalize(uv) * 2.0 + t, 2) + 0.1;\n"
+    "  uv *= f + 0.1;\n"
+    "  uv *= 0.5;\n"
+    "  l = dot(uv, uv);\n"
+    "  vec3 ins = normalize(cd) + 0.1;\n"
+    "  float ind = 0.2 + pow(smoothstep(0.0, 1.5, sqrt(l)) * 48.0, 0.25);\n"
+    "  ind *= ind * ind * ind;\n"
+    "  ind = 1.0 / ind;\n"
+    "  ins *= ind;\n"
+    "  col += ins * ins * sm * smoothstep(0.7, 1.0, ind) * u_coreIntensity * "
+    "2.0;\n"
+    "  col += abs(norm) * (1.0 - d) * sm * 0.25;\n"
+    "  col *= u_brightness;\n"
+    "  fragColor = vec4(col, sm);\n"
+    "}\n";
+
+static GLuint orb_gl_compile(GLenum type, const char *src)
 {
-    if (v < lo) return lo;
-    if (v > hi) return hi;
-    return v;
+    GLuint sh = orb_gl_CreateShader(type);
+    const char *s[] = {src};
+    orb_gl_ShaderSource(sh, 1, s, NULL);
+    orb_gl_CompileShader(sh);
+
+    GLint ok = 0;
+    orb_gl_GetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+
+    if (!ok) {
+        char log[4096];
+        GLsizei n = 0;
+        orb_gl_GetShaderInfoLog(
+            sh, sizeof(log) - 1, &n, log);
+        log[n > 0 ? n : 0] = '\0';
+        fprintf(stderr, "orb GL shader: %s\n", log);
+        orb_gl_DeleteShader(sh);
+        return 0;
+    }
+
+    return sh;
 }
 
-static void render_orb_line(
-    int y,
-    Uint32 *pixels,
-    int width,
-    int height,
-    float time,
-    float audio)
+static GLuint orb_gl_program(void)
 {
-    float radius = 0.285f;
-    radius += audio * 0.018f;
-    float inv_radius = 1.0f / radius;
+    GLuint v = orb_gl_compile(
+        GL_VERTEX_SHADER, ORB_GL_VS);
+    GLuint f = orb_gl_compile(
+        GL_FRAGMENT_SHADER, ORB_GL_FS);
 
-    float ld_len = sqrtf(
-        0.35f * 0.35f +
-        0.45f * 0.45f +
-        1.0f);
+    if (!v || !f)
+        return 0;
 
-    float ldx = -0.35f / ld_len;
-    float ldy = -0.45f / ld_len;
-    float ldz = 1.0f / ld_len;
+    GLuint p = orb_gl_CreateProgram();
+    orb_gl_AttachShader(p, v);
+    orb_gl_AttachShader(p, f);
+    orb_gl_LinkProgram(p);
 
-    float v = (float)y / (float)height;
-    float py = v - 0.5f;
-    float max_reach = radius + 0.06f;
-    float py_abs = py < 0.0f ? -py : py;
+    GLint ok = 0;
+    orb_gl_GetProgramiv(p, GL_LINK_STATUS, &ok);
 
-    if (py_abs > max_reach)
+    if (!ok) {
+        char log[4096];
+        GLsizei n = 0;
+        orb_gl_GetProgramInfoLog(
+            p, sizeof(log) - 1, &n, log);
+        log[n > 0 ? n : 0] = '\0';
+        fprintf(stderr, "orb GL program: %s\n", log);
+    }
+
+    orb_gl_DeleteShader(v);
+    orb_gl_DeleteShader(f);
+
+    return ok ? p : 0;
+}
+
+static float orb_randf(void)
+{
+    return rand() / (float)RAND_MAX;
+}
+
+static void orb_hsv2rgb(
+    float h, float s, float v,
+    float *r, float *g, float *b)
+{
+    float c = v * s;
+    float x = c * (1.0f - fabsf(
+        fmodf(h / 60.0f, 2.0f) - 1.0f));
+    float m = v - c;
+    float rr, gg, bb;
+
+    if (h < 60)      { rr = c; gg = x; bb = 0; }
+    else if (h < 120){ rr = x; gg = c; bb = 0; }
+    else if (h < 180){ rr = 0; gg = c; bb = x; }
+    else if (h < 240){ rr = 0; gg = x; bb = c; }
+    else if (h < 300){ rr = x; gg = 0; bb = c; }
+    else             { rr = c; gg = 0; bb = x; }
+
+    *r = rr + m; *g = gg + m; *b = bb + m;
+}
+
+static void orb_gl_roll_colors(void)
+{
+    float hue = orb_randf() * 360.0f;
+    float r, g, b;
+
+    orb_hsv2rgb(
+        hue, 0.8f, 1.0f, &r, &g, &b);
+    orb_gl_primary_c[0] = r;
+    orb_gl_primary_c[1] = g;
+    orb_gl_primary_c[2] = b;
+
+    orb_hsv2rgb(
+        fmodf(hue + 110.0f, 360.0f),
+        0.9f, 0.9f, &r, &g, &b);
+    orb_gl_secondary_c[0] = r;
+    orb_gl_secondary_c[1] = g;
+    orb_gl_secondary_c[2] = b;
+}
+
+static int orb_gl_init(void)
+{
+    SDL_GL_SetAttribute(
+        SDL_GL_CONTEXT_PROFILE_MASK,
+        SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(
+        SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(
+        SDL_GL_CONTEXT_MINOR_VERSION, 2);
+    SDL_GL_SetAttribute(
+        SDL_GL_CONTEXT_FLAGS,
+        SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+
+    SDL_SetHint(
+        SDL_HINT_VIDEO_HIGHDPI_DISABLED, "1");
+
+    orb_gl_win = SDL_CreateWindow(
+        "sayri-orb",
+        SDL_WINDOWPOS_CENTERED,
+        SDL_WINDOWPOS_CENTERED,
+        ORB_RES, ORB_RES,
+        SDL_WINDOW_HIDDEN |
+        SDL_WINDOW_OPENGL);
+
+    if (!orb_gl_win) {
+        fprintf(stderr,
+            "orb GL window: %s\n",
+            SDL_GetError());
+        return 0;
+    }
+
+    orb_gl_ctx =
+        SDL_GL_CreateContext(orb_gl_win);
+
+    if (!orb_gl_ctx) {
+        fprintf(stderr,
+            "orb GL context: %s\n",
+            SDL_GetError());
+        SDL_DestroyWindow(orb_gl_win);
+        orb_gl_win = NULL;
+        return 0;
+    }
+
+    /*
+        The attributes and HIDPI hint above are
+        global to SDL; put the defaults back so
+        windows/contexts created later (e.g. the
+        dialog box) are unaffected.
+    */
+    SDL_GL_SetAttribute(
+        SDL_GL_CONTEXT_PROFILE_MASK,
+        SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
+    SDL_GL_SetAttribute(
+        SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+    SDL_GL_SetAttribute(
+        SDL_GL_CONTEXT_MINOR_VERSION, 1);
+    SDL_GL_SetAttribute(
+        SDL_GL_CONTEXT_FLAGS, 0);
+    SDL_SetHint(
+        SDL_HINT_VIDEO_HIGHDPI_DISABLED, "0");
+
+    SDL_GL_MakeCurrent(orb_gl_win, orb_gl_ctx);
+
+#define LOAD(name) \
+    orb_gl_##name = (orb_gl_##name##_fn) \
+        SDL_GL_GetProcAddress("gl" #name)
+    LOAD(UseProgram);
+    LOAD(Uniform1f);
+    LOAD(Uniform2f);
+    LOAD(Uniform3f);
+    LOAD(Uniform4f);
+    LOAD(GetUniformLocation);
+    LOAD(Viewport);
+    LOAD(DrawArrays);
+    LOAD(Enable);
+    LOAD(Disable);
+    LOAD(BlendFunc);
+    LOAD(ClearColor);
+    LOAD(Clear);
+    LOAD(GenVertexArrays);
+    LOAD(BindVertexArray);
+    LOAD(DeleteVertexArrays);
+    LOAD(CreateShader);
+    LOAD(ShaderSource);
+    LOAD(CompileShader);
+    LOAD(GetShaderiv);
+    LOAD(GetShaderInfoLog);
+    LOAD(DeleteShader);
+    LOAD(CreateProgram);
+    LOAD(AttachShader);
+    LOAD(LinkProgram);
+    LOAD(GetProgramiv);
+    LOAD(GetProgramInfoLog);
+    LOAD(DeleteProgram);
+    LOAD(ReadPixels);
+#undef LOAD
+
+    if (!orb_gl_UseProgram ||
+        !orb_gl_CreateShader ||
+        !orb_gl_ReadPixels ||
+        !orb_gl_DrawArrays) {
+        fprintf(stderr,
+            "orb: GL 3.x unavailable, "
+            "using software orb\n");
+        goto fail;
+    }
+
+    orb_gl_GenVertexArrays(1, &orb_gl_vao);
+    orb_gl_BindVertexArray(orb_gl_vao);
+
+    orb_gl_prog = orb_gl_program();
+
+    if (!orb_gl_prog)
+        goto fail;
+
+    orb_gl_loc_viewport =
+        orb_gl_GetUniformLocation(
+            orb_gl_prog, "u_viewport");
+    orb_gl_loc_resolution =
+        orb_gl_GetUniformLocation(
+            orb_gl_prog, "u_resolution");
+    orb_gl_loc_time =
+        orb_gl_GetUniformLocation(
+            orb_gl_prog, "u_time");
+    orb_gl_loc_primary =
+        orb_gl_GetUniformLocation(
+            orb_gl_prog, "u_primary");
+    orb_gl_loc_secondary =
+        orb_gl_GetUniformLocation(
+            orb_gl_prog, "u_secondary");
+    orb_gl_loc_noise =
+        orb_gl_GetUniformLocation(
+            orb_gl_prog, "u_noiseIntensity");
+    orb_gl_loc_glow =
+        orb_gl_GetUniformLocation(
+            orb_gl_prog, "u_glowIntensity");
+    orb_gl_loc_sat =
+        orb_gl_GetUniformLocation(
+            orb_gl_prog, "u_saturation");
+    orb_gl_loc_bright =
+        orb_gl_GetUniformLocation(
+            orb_gl_prog, "u_brightness");
+    orb_gl_loc_rot =
+        orb_gl_GetUniformLocation(
+            orb_gl_prog, "u_rotationSpeed");
+    orb_gl_loc_nscale =
+        orb_gl_GetUniformLocation(
+            orb_gl_prog, "u_noiseScale");
+    orb_gl_loc_core =
+        orb_gl_GetUniformLocation(
+            orb_gl_prog, "u_coreIntensity");
+    orb_gl_loc_edge =
+        orb_gl_GetUniformLocation(
+            orb_gl_prog, "u_edgeSoftness");
+
+    orb_gl_read = (unsigned char *)malloc(
+        ORB_RES * ORB_RES * 4);
+
+    if (!orb_gl_read)
+        goto fail;
+
+    srand((unsigned)time(NULL));
+    orb_gl_roll_colors();
+
+    orb_gl_ok = 1;
+
+    return 1;
+
+fail:
+    if (orb_gl_prog) {
+        orb_gl_DeleteProgram(orb_gl_prog);
+        orb_gl_prog = 0;
+    }
+    if (orb_gl_vao) {
+        orb_gl_DeleteVertexArrays(
+            1, &orb_gl_vao);
+        orb_gl_vao = 0;
+    }
+    free(orb_gl_read);
+    orb_gl_read = NULL;
+    SDL_GL_DeleteContext(orb_gl_ctx);
+    SDL_DestroyWindow(orb_gl_win);
+    orb_gl_win = NULL;
+    orb_gl_ctx = NULL;
+    return 0;
+}
+
+static void orb_gl_render(Orb *orb)
+{
+    if (!orb_gl_ok)
         return;
 
-    float py2 = py * py;
+    SDL_GL_MakeCurrent(orb_gl_win, orb_gl_ctx);
 
-    for (int x = 0; x < width; x++) {
+    orb_gl_Disable(GL_BLEND);
+    orb_gl_ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    orb_gl_Clear(GL_COLOR_BUFFER_BIT);
 
-        float u = (float)x / (float)width;
-        float px = u - 0.5f;
+    orb_gl_UseProgram(orb_gl_prog);
 
-        float pr2 = px * px + py2;
+    orb_gl_Uniform4f(
+        orb_gl_loc_viewport,
+        0.0f, 0.0f,
+        (float)ORB_RES, (float)ORB_RES);
+    orb_gl_Uniform2f(
+        orb_gl_loc_resolution,
+        (float)ORB_RES, (float)ORB_RES);
+    orb_gl_Uniform1f(
+        orb_gl_loc_time, orb->time);
+    orb_gl_Uniform3f(
+        orb_gl_loc_primary,
+        orb_gl_primary_c[0],
+        orb_gl_primary_c[1],
+        orb_gl_primary_c[2]);
+    orb_gl_Uniform3f(
+        orb_gl_loc_secondary,
+        orb_gl_secondary_c[0],
+        orb_gl_secondary_c[1],
+        orb_gl_secondary_c[2]);
+    orb_gl_Uniform1f(
+        orb_gl_loc_noise, 1.0f);
+    orb_gl_Uniform1f(
+        orb_gl_loc_glow, 1.4f);
+    orb_gl_Uniform1f(
+        orb_gl_loc_sat, 2.0f);
+    orb_gl_Uniform1f(
+        orb_gl_loc_bright, 1.0f);
+    orb_gl_Uniform1f(
+        orb_gl_loc_rot, 1.0f);
+    orb_gl_Uniform1f(
+        orb_gl_loc_nscale, 3.0f);
+    orb_gl_Uniform1f(
+        orb_gl_loc_core, 0.55f);
+    orb_gl_Uniform1f(
+        orb_gl_loc_edge, 0.045f);
 
-        if (pr2 > max_reach * max_reach)
-            continue;
+    orb_gl_Viewport(
+        0, 0, ORB_RES, ORB_RES);
+    orb_gl_DrawArrays(
+        GL_TRIANGLES, 0, 3);
 
-        float r = sqrtf(pr2);
+    orb_gl_ReadPixels(
+        0, 0, ORB_RES, ORB_RES,
+        GL_RGBA, GL_UNSIGNED_BYTE,
+        orb_gl_read);
 
-        /*
-            Anti-aliased sphere coverage.
+    /*
+        GL rows come bottom-up; SDL textures
+        are top-down, so mirror when packing.
+    */
+    for (int y = 0; y < ORB_RES; y++) {
+        const unsigned char *src =
+            orb_gl_read +
+            (ORB_RES - 1 - y) *
+            ORB_RES * 4;
+        Uint32 *dst = orb->pixels + y * ORB_RES;
 
-            The band is ~4.5 texels wide at
-            ORB_RES so the boundary stays
-            smooth through linear scaling.
-        */
-        float inside = 1.0f - clampf(
-            (r - radius) * 60.0f,
-            0.0f, 1.0f);
+        for (int x = 0; x < ORB_RES; x++) {
+            int r = src[x * 4 + 0];
+            int g = src[x * 4 + 1];
+            int b = src[x * 4 + 2];
+            int a = src[x * 4 + 3];
 
-        /*
-            Outside the sphere there is nothing
-            to draw — skipping keeps the buffer
-            transparent without hard cuts.
-        */
-        if (inside < 0.001f)
-            continue;
+            if (r > 255) r = 255;
+            if (g > 255) g = 255;
+            if (b > 255) b = 255;
+            if (a > 255) a = 255;
 
-        float t = time;
-        float qx = px * inv_radius;
-        float qy = py * inv_radius;
-
-        float qlen2 = qx * qx + qy * qy;
-        float omq = 1.0f - qlen2;
-        float sphereZ = sqrtf(omq > 0.0f ? omq : 0.0f);
-
-        float flow_x =
-            qx + sinf(qy * 4.0f + t * 0.75f) * 0.10f;
-        float flow_y =
-            qy + cosf(qx * 5.0f - t * 0.62f) * 0.08f;
-
-        float n1 =
-            sinf(flow_x * 3.7f + flow_y * 2.3f + t * 0.4f) * 0.5f +
-            sinf(flow_x * 1.9f - flow_y * 4.1f - t * 0.3f) * 0.25f + 0.375f;
-
-        float n2 =
-            cosf(flow_x * 5.1f + flow_y * 1.7f - t * 0.5f) * 0.5f +
-            cosf(flow_x * 2.3f - flow_y * 3.8f + t * 0.2f) * 0.25f + 0.375f;
-
-        float wave1 = sinf(
-            qx * 4.0f + qy * 2.0f +
-            t * 1.25f + n1 * 2.2f);
-
-        float ribbon1 =
-            expf(-fabsf(wave1) * 2.8f);
-
-        float wave2 = sinf(
-            qx * 7.0f - qy * 3.0f -
-            t * 1.6f + n2 * 3.0f);
-
-        float ribbon2 =
-            expf(-fabsf(wave2) * 4.0f);
-
-        float colorPos =
-            qx * 0.38f + qy * 0.25f +
-            n1 * 0.55f + t * 0.035f;
-
-        float c1r, c1g, c1b;
-        float c2r, c2g, c2b;
-
-        {
-            float t2 = colorPos - floorf(colorPos);
-            float mr = 1.00f, mg = 0.02f, mb = 0.42f;
-            float pr = 0.55f, pg = 0.05f, pb = 1.00f;
-            float br = 0.04f, bg2 = 0.20f, bb = 1.00f;
-            float cr = 0.00f, cg = 0.85f, cb = 1.00f;
-            float pir = 1.00f, pig = 0.30f, pib = 0.75f;
-
-            if (t2 < 0.20f) {
-                float s = t2 * 5.0f;
-                c1r = mr + (pr - mr) * s;
-                c1g = mg + (pg - mg) * s;
-                c1b = mb + (pb - mb) * s;
-            } else if (t2 < 0.45f) {
-                float s = (t2 - 0.20f) * 4.0f;
-                c1r = pr + (br - pr) * s;
-                c1g = pg + (bg2 - pg) * s;
-                c1b = pb + (bb - pb) * s;
-            } else if (t2 < 0.70f) {
-                float s = (t2 - 0.45f) * 4.0f;
-                c1r = br + (cr - br) * s;
-                c1g = bg2 + (cg - bg2) * s;
-                c1b = bb + (cb - bb) * s;
-            } else {
-                float s = (t2 - 0.70f) * 3.333f;
-                c1r = cr + (pir - cr) * s;
-                c1g = cg + (pig - cg) * s;
-                c1b = cb + (pib - cb) * s;
-            }
+            dst[x] =
+                ((Uint32)a << 24) |
+                ((Uint32)r << 16) |
+                ((Uint32)g << 8) |
+                (Uint32)b;
         }
-
-        {
-            float t2 = colorPos + 0.37f;
-            t2 = t2 - floorf(t2);
-            float mr = 1.00f, mg = 0.02f, mb = 0.42f;
-            float pr = 0.55f, pg = 0.05f, pb = 1.00f;
-            float br = 0.04f, bg2 = 0.20f, bb = 1.00f;
-            float cr = 0.00f, cg = 0.85f, cb = 1.00f;
-            float pir = 1.00f, pig = 0.30f, pib = 0.75f;
-
-            if (t2 < 0.20f) {
-                float s = t2 * 5.0f;
-                c2r = mr + (pr - mr) * s;
-                c2g = mg + (pg - mg) * s;
-                c2b = mb + (pb - mb) * s;
-            } else if (t2 < 0.45f) {
-                float s = (t2 - 0.20f) * 4.0f;
-                c2r = pr + (br - pr) * s;
-                c2g = pg + (bg2 - pg) * s;
-                c2b = pb + (bb - pb) * s;
-            } else if (t2 < 0.70f) {
-                float s = (t2 - 0.45f) * 4.0f;
-                c2r = br + (cr - br) * s;
-                c2g = bg2 + (cg - bg2) * s;
-                c2b = bb + (cb - bb) * s;
-            } else {
-                float s = (t2 - 0.70f) * 3.333f;
-                c2r = cr + (pir - cr) * s;
-                c2g = cg + (pig - cg) * s;
-                c2b = cb + (pib - cb) * s;
-            }
-        }
-
-        float r2b = ribbon2 * 0.50f;
-        float color_r = c1r + (c2r - c1r) * r2b;
-        float color_g = c1g + (c2g - c1g) * r2b;
-        float color_b = c1b + (c2b - c1b) * r2b;
-
-        float intensity =
-            (ribbon1 * 0.95f + ribbon2 * 0.45f)
-            * (0.75f + audio * 0.90f);
-
-        float inv_len =
-            1.0f / sqrtf(
-                qlen2 +
-                sphereZ * sphereZ +
-                0.0001f);
-
-        float nz = sphereZ * inv_len;
-
-        float diffuse =
-            qx * inv_len * ldx +
-            qy * inv_len * ldy +
-            nz * ldz;
-
-        if (diffuse < 0.0f)
-            diffuse = 0.0f;
-
-        float lighting = 0.72f + diffuse * 0.55f;
-        color_r *= lighting;
-        color_g *= lighting;
-        color_b *= lighting;
-
-        float nz_c = nz > 0.0f ? nz : 0.0f;
-        float f_t = 1.0f - nz_c;
-        float fresnel =
-            f_t * f_t * f_t * sqrtf(f_t);
-
-        color_r += 0.188f * fresnel;
-        color_g += 0.488f * fresnel;
-        color_b += 0.750f * fresnel;
-
-        color_r *= intensity;
-        color_g *= intensity;
-        color_b *= intensity;
-
-        /*
-            Soft alpha from the coverage ramp
-            only — never punched out by color
-            brightness, so the silhouette stays
-            smooth while the ribbons move.
-        */
-        float alpha = inside;
-
-        float final_r = color_r * inside;
-        float final_g = color_g * inside;
-        float final_b = color_b * inside;
-
-        float edge = clampf(
-            (r - (radius - 0.035f)) * 28.571f,
-            0.0f, 1.0f);
-
-        float ei = edge * 0.55f * inside;
-        final_r += 0.25f * ei;
-        final_g += 0.55f * ei;
-        final_b += 1.00f * ei;
-
-        float r2 = r * r;
-
-        float glow =
-            expf(-r2 * 12.0f) * inside;
-
-        float centerGlow =
-            expf(-r2 * 23.0f) * inside;
-
-        final_r += glow * 0.29f + centerGlow * 1.8f;
-        final_g += glow * 0.49f + centerGlow * 0.99f;
-        final_b += glow * 0.65f + centerGlow * 1.56f;
-
-        final_r *= intensity;
-        final_g *= intensity;
-        final_b *= intensity;
-
-        if (final_r < 0.0f) final_r = 0.0f;
-        if (final_g < 0.0f) final_g = 0.0f;
-        if (final_b < 0.0f) final_b = 0.0f;
-
-        if (final_r > 1.0f) final_r = 1.0f;
-        if (final_g > 1.0f) final_g = 1.0f;
-        if (final_b > 1.0f) final_b = 1.0f;
-
-        Uint8 a =
-            (Uint8)(clampf(
-                alpha * 255.0f, 0.0f, 255.0f));
-
-        /*
-            NOTE: no brightness-based alpha
-            culling here — dimming the rim by
-            color is what caused a jagged,
-            flickering boundary. The coverage
-            ramp above owns the edge entirely.
-        */
-        pixels[y * width + x] =
-            (a << 24) |
-            ((Uint8)(final_r * 255.0f) << 16) |
-            ((Uint8)(final_g * 255.0f) << 8) |
-            (Uint8)(final_b * 255.0f);
     }
 }
+
+
+
+static int g_gl_up = 0;
 
 void orb_init(
     Orb *orb,
     SDL_Renderer *renderer)
 {
-    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
-
     orb->texture =
         SDL_CreateTexture(
             renderer,
@@ -305,21 +581,67 @@ void orb_init(
         orb->texture,
         SDL_BLENDMODE_BLEND);
 
-    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
-
     orb->time = 0.0f;
-    orb->audio = 0.0f;
     orb->dirty = true;
     orb->visible = true;
+    orb->fallback = NULL;
 
     memset(
         orb->pixels,
         0,
         sizeof(orb->pixels));
+
+    if (orb_gl_init()) {
+        g_gl_up = 1;
+        orb_gl_render(orb);
+    } else {
+        Orb1 *fb = (Orb1 *)malloc(sizeof(Orb1));
+
+        if (fb) {
+            orb1_init(fb, renderer);
+            orb->fallback = fb;
+        }
+    }
 }
 
 void orb_free(Orb *orb)
 {
+    if (orb->fallback) {
+        orb1_free((Orb1 *)orb->fallback);
+        free(orb->fallback);
+        orb->fallback = NULL;
+        return;
+    }
+
+    if (g_gl_up) {
+        g_gl_up = 0;
+        orb_gl_ok = 0;
+
+        SDL_GL_MakeCurrent(
+            orb_gl_win, orb_gl_ctx);
+
+        if (orb_gl_prog) {
+            orb_gl_DeleteProgram(
+                orb_gl_prog);
+            orb_gl_prog = 0;
+        }
+
+        if (orb_gl_vao) {
+            orb_gl_DeleteVertexArrays(
+                1, &orb_gl_vao);
+            orb_gl_vao = 0;
+        }
+
+        free(orb_gl_read);
+        orb_gl_read = NULL;
+
+        SDL_GL_DeleteContext(orb_gl_ctx);
+        SDL_DestroyWindow(orb_gl_win);
+
+        orb_gl_ctx = NULL;
+        orb_gl_win = NULL;
+    }
+
     if (orb->texture) {
         SDL_DestroyTexture(orb->texture);
         orb->texture = NULL;
@@ -330,28 +652,12 @@ void orb_update(Orb *orb, float dt)
 {
     orb->time += dt;
 
-    orb->audio =
-        0.50f
-        + 0.25f * sinf(orb->time * 2.1f)
-        + 0.15f * sinf(orb->time * 5.7f)
-        + 0.08f * sinf(orb->time * 11.0f);
-
-    if (orb->audio < 0.0f)
-        orb->audio = 0.0f;
-
-    if (orb->audio > 1.0f)
-        orb->audio = 1.0f;
-
-    for (int y = 0; y < ORB_RES; y++) {
-        render_orb_line(
-            y,
-            orb->pixels,
-            ORB_RES,
-            ORB_RES,
-            orb->time,
-            orb->audio);
+    if (orb->fallback) {
+        orb1_update((Orb1 *)orb->fallback, dt);
+        return;
     }
 
+    orb_gl_render(orb);
     orb->dirty = true;
 }
 
@@ -360,6 +666,12 @@ void orb_draw(
     SDL_Renderer *renderer,
     SDL_Rect dst)
 {
+    if (orb->fallback) {
+        orb1_draw((Orb1 *)orb->fallback,
+            renderer, dst);
+        return;
+    }
+
     if (!orb->texture || !orb->visible)
         return;
 

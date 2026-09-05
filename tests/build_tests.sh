@@ -11,7 +11,8 @@ OUT="$(mktemp -d)"
 
 trap 'rm -rf "$OUT"' EXIT
 
-LIBS="-lcurl -lSDL2"
+LIBS="-lcurl $(sdl2-config --libs)"
+SDL_CFLAGS="$(sdl2-config --cflags) -I$(sdl2-config --prefix)/include"
 
 echo "== thist: history round-trip =="
 
@@ -24,14 +25,14 @@ gcc -Wall -Wextra -O2 -I "$ROOT" \
 
 echo "== tollama: blocking client =="
 
+# shellcheck disable=SC2086
 gcc -Wall -Wextra -O2 -I "$ROOT" \
+    $SDL_CFLAGS \
     "$ROOT/tests/tollama.c" \
     "$ROOT/ollama.c" \
     -o "$OUT/tollama" $LIBS
 
 "$OUT/tollama"
-
-SDL_CFLAGS="$(sdl2-config --cflags)"
 
 echo "== tasync: begin/poll loop =="
 
@@ -63,9 +64,17 @@ gcc -Wall -Wextra -O2 -I "$ROOT" \
 
 "$OUT/torb" | tail -2
 
-# --- tcancel: shutdown aborts transfers ---
+echo "== tglprobe: GL orb availability =="
 
-SDL_CFLAGS="$(sdl2-config --cflags)"
+# shellcheck disable=SC2086
+gcc -Wall -Wextra -O2 -I "$ROOT" \
+    $SDL_CFLAGS \
+    "$ROOT/tests/tglprobe.c" \
+    -o "$OUT/tglprobe" -lSDL2
+
+"$OUT/tglprobe"
+
+# --- tcancel: shutdown aborts transfers ---
 
 # shellcheck disable=SC2086
 gcc -Wall -Wextra -O2 -I "$ROOT" \

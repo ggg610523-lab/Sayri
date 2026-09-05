@@ -38,6 +38,7 @@ SOURCES = \
     imageWidget.c \
     textinput.c \
     orb.c \
+    orb1.c \
     toggle.c \
     popup.c \
     history.c \

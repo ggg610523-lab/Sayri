@@ -1,25 +1,25 @@
 /*
-    Orb edge-quality probe.
+    Orb1 edge-quality probe.
 
-    Includes orb.c directly to reach the
+    Includes orb1.c directly to reach the
     static per-line renderer, then prints
     the alpha ramp across the boundary of
     the middle row.
 */
-#include "../orb.c"
+#include "../orb1.c"
 
 #include <stdio.h>
 
 int main(void)
 {
-    Uint32 pixels[ORB_RES * ORB_RES];
+    Uint32 pixels[ORB1_RES * ORB1_RES];
 
     memset(pixels, 0, sizeof(pixels));
 
-    int mid = ORB_RES / 2;
+    int mid = ORB1_RES / 2;
 
-    render_orb_line(
-        mid, pixels, ORB_RES, ORB_RES,
+    render_orb1_line(
+        mid, pixels, ORB1_RES, ORB1_RES,
         1.0f, 0.5f);
 
     /*
@@ -32,10 +32,10 @@ int main(void)
     int hard = 0;
     int first = -1, last = -1;
 
-    for (int x = 0; x < ORB_RES; x++) {
+    for (int x = 0; x < ORB1_RES; x++) {
 
         int a =
-            (pixels[mid * ORB_RES + x]
+            (pixels[mid * ORB1_RES + x]
                 >> 24) & 0xFF;
 
         if (a > 0 && first < 0)
@@ -61,11 +61,11 @@ int main(void)
     printf("ramp: ");
 
     for (int x = first > 0 ? first - 2 : 0;
-         x <= last + 2 && x < ORB_RES;
+         x <= last + 2 && x < ORB1_RES;
          x++) {
 
         int a =
-            (pixels[mid * ORB_RES + x]
+            (pixels[mid * ORB1_RES + x]
                 >> 24) & 0xFF;
 
         printf("%d ", a / 26);
