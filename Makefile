@@ -3,8 +3,10 @@ CC = gcc
 
 TARGET = pulsar-assistant
 
+BREW_INCLUDE := $(wildcard /opt/homebrew/include)
+
 CFLAGS = -Wall -Wextra -O2 \
-         -I/opt/homebrew/include \
+         $(if $(BREW_INCLUDE),-I$(BREW_INCLUDE)) \
          $(shell sdl2-config --cflags)
 
 LIBS = $(shell sdl2-config --libs) \

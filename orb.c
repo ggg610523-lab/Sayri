@@ -298,6 +298,20 @@ static int orb_gl_init(void)
         SDL_GL_CONTEXT_FLAGS,
         SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
 
+#if defined(__linux__)
+    /*
+        Linux patch: X11/Wayland give us a default
+        framebuffer with no alpha channel unless we
+        ask for one. Without this the shader's radial
+        alpha is forced to 1.0 by the time glReadPixels
+        returns, so the whole ORB_RES square reads back
+        opaque and the region outside the orb renders
+        as a black box over the app background.
+    */
+    SDL_GL_SetAttribute(
+        SDL_GL_ALPHA_SIZE, 8);
+#endif
+
     SDL_SetHint(
         SDL_HINT_VIDEO_HIGHDPI_DISABLED, "1");
 
@@ -343,6 +357,10 @@ static int orb_gl_init(void)
         SDL_GL_CONTEXT_MINOR_VERSION, 1);
     SDL_GL_SetAttribute(
         SDL_GL_CONTEXT_FLAGS, 0);
+#if defined(__linux__)
+    SDL_GL_SetAttribute(
+        SDL_GL_ALPHA_SIZE, 0);
+#endif
     SDL_SetHint(
         SDL_HINT_VIDEO_HIGHDPI_DISABLED, "0");
 
