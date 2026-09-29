@@ -43,6 +43,7 @@ SOURCES = \
     popup.c \
     history.c \
     downloads.c \
+    ripple.c \
     ollama.c \
     ipc.c \
     relay.c \

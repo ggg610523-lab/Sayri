@@ -1,0 +1,17 @@
+# Gradle / Android build outputs
+app/build/
+app/.cxx/
+.gradle/
+local.properties
+*.iml
+.idea/
+
+# Compiled objects and shared libs (regenerated; the Android SDK builds
+# these from source). The prebuilt libcurl static archive is kept for the
+# build instead: see !app/jni/curl/ below.
+*.o
+*.so
+
+# Keep the prebuilt libcurl (build dependency for the arm64 target).
+!app/jni/curl/lib/
+!app/jni/curl/include/

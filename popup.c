@@ -1,4 +1,5 @@
 #include "popup.h"
+#include "ripple.h"
 
 void popup_init(
     UIPopup *pop,
@@ -306,6 +307,23 @@ void popup_event(
                 dropdown_event(
                     dd,
                     event);
+
+                if (dd_zone) {
+                    int x = event->button.x;
+                    int y = event->button.y;
+
+                    if (ui_point_in_rect(x, y, dd->rect))
+                        ripple_tap(
+                            dd->rect,
+                            14.0f * ui->scale,
+                            RIPPLE_TAG_REGION, x, y);
+                    else if (ui_point_in_rect(
+                        x, y, dd->listRect))
+                        ripple_tap(
+                            dd->listRect,
+                            14.0f * ui->scale,
+                            RIPPLE_TAG_REGION, x, y);
+                }
             }
 
             if (pop->search)
@@ -326,6 +344,15 @@ void popup_event(
 
         int mx = event->button.x;
         int my = event->button.y;
+
+        /*
+            Panel ripple: warp the whole popover
+            from the tap point.
+        */
+        ripple_tap(
+            pop->rect,
+            16.0f * ui->scale,
+            RIPPLE_TAG_REGION, mx, my);
 
         /*
             Search bar owns clicks in its rect
@@ -635,5 +662,19 @@ void popup_draw(
                 hov
                 ? (UIColor){150,195,255,a}
                 : (UIColor){200,208,228,a}));
+    }
+
+    /*
+        Ripple overlay: warp the freshly drawn
+        panel (and its dropdown) back over itself.
+    */
+    ripple_draw(renderer, pop->rect,
+                RIPPLE_TAG_REGION);
+
+    if (pop->dropdown) {
+        ripple_draw(renderer, pop->dropdown->rect,
+                    RIPPLE_TAG_REGION);
+        ripple_draw(renderer, pop->dropdown->listRect,
+                    RIPPLE_TAG_REGION);
     }
 }

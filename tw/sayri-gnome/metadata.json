@@ -1,0 +1,8 @@
+{
+  "uuid": "sayri@pulsar.tools",
+  "name": "Sayri Assistant",
+  "description": "Chat with Sayri (the local AI assistant) right from the GNOME Shell panel, using the same design language as the Sayri app: an animated orb, a text field and a circular send button. Requires the Sayri app to be running so it can talk to it over its IPC socket.",
+  "shell-version": ["45", "46", "47", "48", "49", "50", "51"],
+  "version-name": "1.0",
+  "url": "https://github.com/"
+}

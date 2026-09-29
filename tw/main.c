@@ -1,0 +1,2985 @@
+
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_image.h>
+#include <SDL2/SDL_ttf.h>
+
+#include <stdio.h>
+#include <stdbool.h>
+#include <string.h>
+#include <math.h>
+#include <ctype.h>
+#include <stdlib.h>
+#include <dirent.h>
+#include <unistd.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <net/if.h>
+
+#include "ui.h"
+#include "hamburger.h"
+#include "sidebar.h"
+#include "orb.h"
+#include "toggle.h"
+#include "popup.h"
+#include "downloads.h"
+#include "ollama.h"
+#include "history.h"
+#include "ipc.h"
+#include "relay.h"
+#include "qrsurface.h"
+#include <time.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+#define MAX_MESSAGES 32
+#define MSG_MAX 2048
+#define INPUT_MAX 256
+
+#define OLLAMA_MODEL "llama3.2"
+#define OLLAMA_HISTORY 10
+#define MAX_MODELS 16
+
+static char g_current_model[128] = OLLAMA_MODEL;
+static char g_models[MAX_MODELS][128];
+static int g_model_count = 0;
+static int g_model_idx = 0;
+
+static HistoryList g_history;
+static char g_item_labels[HISTORY_MAX_FILES][32];
+
+/*
+    Search panel state. Labels are shown in
+    the popup; files[] maps each row back to
+    the session to load ("": empty-state row).
+*/
+static UIPopup searchPopup;
+static UISearchBar searchInput;
+static char g_search_labels[POPUP_MAX_ITEMS][72];
+static char g_search_files[POPUP_MAX_ITEMS][64];
+static char g_last_query[SEARCHBAR_MAX];
+
+/*
+    False once /api proves unreachable —
+    the Downloads panel then offers full
+    bootstrap.
+*/
+static bool g_server_ok = true;
+
+/*
+    Zero-config auto-heal: when a chat hits a
+    dead server, the bootstrap runs by itself
+    and the turn is replayed once it lands.
+*/
+static bool g_retry_pending = false;
+static int g_autoheal_attempts = 0;
+
+/*
+    IPC reply routing: a client connects, sends one
+    message; the answer is written back to this fd
+    when the current turn resolves.
+*/
+static int g_ipc_fd = -1;
+static bool g_relay_ok = false;
+static bool g_pair_box = false;
+static char g_pair_code[RELAY_CODE_LEN + 1] = "";
+
+static UIColor lerp_color(
+    UIColor a, UIColor b, float t)
+{
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    return (UIColor){
+        (Uint8)(a.r + (b.r - a.r) * t),
+        (Uint8)(a.g + (b.g - a.g) * t),
+        (Uint8)(a.b + (b.b - a.b) * t),
+        (Uint8)(a.a + (b.a - a.a) * t)
+    };
+}
+
+typedef struct {
+    char text[MSG_MAX];
+    bool is_user;
+    float alpha;
+    float slide_y;
+} ChatMessage;
+
+typedef struct {
+    ChatMessage messages[MAX_MESSAGES];
+    int count;
+
+    char input[INPUT_MAX];
+    int input_len;
+    bool input_focused;
+
+    float scroll_offset;
+    float target_scroll;
+
+    bool is_thinking;
+
+    char cur_session[64];
+} AppState;
+
+#define MAX_BUBBLE_RIPPLES 8
+#define RIPPLE_DURATION 1.2f
+
+/*
+    One expanding water ripple on a tapped chat
+    bubble. Ported from the ShaderToy-style wave
+    in test/ripple.c: a damped sine crest expands
+    outward from the tap point at 1200 px/s and is
+    clipped to the bubble it was started on.
+*/
+typedef struct {
+    bool active;
+    int msg_index;
+    float ox, oy;
+    float amplitude;
+    Uint64 startMs;
+
+    /*
+        Pristine snapshot of the bubble taken on the
+        ripple's first frame; it is the warp source
+        for every later frame, like the static card
+        texture in test/ripple.c. Without this, each
+        read-back re-warped the previous frame's
+        output and the ripple compounded.
+    */
+    Uint32 *snap;
+    int snap_w, snap_h;
+} BubbleRipple;
+
+static BubbleRipple g_ripples[MAX_BUBBLE_RIPPLES];
+
+static void clear_bubble_ripples(void);
+
+static char *find_font(void)
+{
+    DIR *dir = opendir("font");
+    if (!dir) return NULL;
+
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        const char *name = entry->d_name;
+        size_t len = strlen(name);
+        if (len > 4 &&
+            strcasecmp(name + len - 4, ".ttf") == 0) {
+            char *path =
+                malloc(strlen("font/") + strlen(name) + 1);
+            sprintf(path, "font/%s", name);
+            closedir(dir);
+            return path;
+        }
+    }
+
+    closedir(dir);
+    return NULL;
+}
+
+/* ============================================================
+   Scale-aware fonts
+   ============================================================ */
+
+static char g_font_path[600];
+
+typedef struct {
+    TTF_Font *font;        /* 13 pt design */
+    TTF_Font *titleFont;   /* 15 pt        */
+    TTF_Font *smallFont;   /* 10 pt        */
+    TTF_Font *boldFont;    /* 15 pt        */
+    TTF_Font *menuFont;    /* 16 pt        */
+} Fonts;
+
+static void close_fonts(Fonts *fs)
+{
+    if (fs->font)
+        TTF_CloseFont(fs->font);
+    if (fs->titleFont)
+        TTF_CloseFont(fs->titleFont);
+    if (fs->smallFont)
+        TTF_CloseFont(fs->smallFont);
+    if (fs->boldFont)
+        TTF_CloseFont(fs->boldFont);
+    if (fs->menuFont)
+        TTF_CloseFont(fs->menuFont);
+
+    memset(fs, 0, sizeof(*fs));
+}
+
+/*
+    Rasterize every role at pt * scale with
+    light hinting: glyphs are regenerated by
+    the vector rasterizer for the exact size
+    on screen, so text never turns into an
+    upscaled bitmap when the window grows.
+*/
+static bool load_fonts(
+    Fonts *fs, float scale)
+{
+    close_fonts(fs);
+
+    const int pts[5] = {
+        13, 15, 10, 15, 16
+    };
+
+    TTF_Font **slots[5] = {
+        &fs->font,
+        &fs->titleFont,
+        &fs->smallFont,
+        &fs->boldFont,
+        &fs->menuFont
+    };
+
+    for (int i = 0; i < 5; i++) {
+
+        int px = (int)roundf(
+            (float)pts[i] * scale);
+
+        if (px < 7)
+            px = 7;
+
+        TTF_Font *f =
+            TTF_OpenFont(g_font_path, px);
+
+        if (!f) {
+            close_fonts(fs);
+            return false;
+        }
+
+        TTF_SetFontHinting(
+            f, TTF_HINTING_LIGHT);
+
+        *slots[i] = f;
+    }
+
+    return true;
+}
+
+static void add_message(
+    AppState *state,
+    const char *text,
+    bool is_user)
+{
+    if (state->count >= MAX_MESSAGES)
+        return;
+
+    ChatMessage *m =
+        &state->messages[state->count];
+
+    snprintf(m->text, sizeof(m->text),
+             "%s", text);
+    m->is_user = is_user;
+    m->alpha = 0.0f;
+    m->slide_y = 16.0f;
+
+    state->count++;
+}
+
+static void persist_session(
+    AppState *st)
+{
+    if (st->count == 0)
+        return;
+
+    /*
+        Don't persist a bare welcome screen.
+    */
+    if (st->count == 1 &&
+        !st->messages[0].is_user)
+        return;
+
+    const char *roles[MAX_MESSAGES];
+    const char *texts[MAX_MESSAGES];
+
+    for (int i = 0; i < st->count; i++) {
+        roles[i] =
+            st->messages[i].is_user
+            ? "user" : "assistant";
+        texts[i] = st->messages[i].text;
+    }
+
+    history_save(st->cur_session,
+                 st->cur_session,
+                 sizeof(st->cur_session),
+                 roles, texts, st->count);
+}
+
+/*
+    ASCII case-insensitive substring search.
+*/
+static bool ci_contains(
+    const char *hay,
+    const char *needle)
+{
+    if (!*needle)
+        return true;
+
+    size_t nlen =
+        strlen(needle);
+
+    for (; *hay; hay++) {
+
+        size_t i = 0;
+
+        while (i < nlen &&
+               hay[i] &&
+               tolower((unsigned char)hay[i]) ==
+                   tolower((unsigned char)needle[i]))
+            i++;
+
+        if (i == nlen)
+            return true;
+
+        if (!hay[i])
+            break;
+    }
+
+    return false;
+}
+
+/*
+    Replace the visible conversation with a
+    saved session.
+*/
+static void load_session_file(
+    AppState *st,
+    const char *name)
+{
+    char (*texts)[HISTORY_TEXT_MAX] =
+        malloc(sizeof(char[MAX_MESSAGES]
+                      [HISTORY_TEXT_MAX]));
+
+    if (!texts)
+        return;
+
+    unsigned char flags[MAX_MESSAGES];
+
+    int n = history_load(
+        name, texts, flags, MAX_MESSAGES);
+
+    st->count = 0;
+    st->cur_session[0] = '\0';
+    clear_bubble_ripples();
+
+    for (int i = 0; i < n; i++)
+        add_message(st,
+            texts[i],
+            flags[i] != 0);
+
+    snprintf(st->cur_session,
+             sizeof(st->cur_session),
+             "%s", name);
+
+    free(texts);
+}
+
+/*
+    Rebuild the Search popup rows from the
+    query: matches session names and every
+    stored message body.
+*/
+static void rebuild_search_results(void)
+{
+    g_history.count = 0;
+
+    history_list(&g_history);
+
+    const char *q = searchInput.text;
+
+    char (*texts)[HISTORY_TEXT_MAX] =
+        malloc(sizeof(char[MAX_MESSAGES]
+                      [HISTORY_TEXT_MAX]));
+
+    int n = 0;
+
+    for (int k = 0;
+         k < g_history.count &&
+             n < POPUP_MAX_ITEMS;
+         k++) {
+
+        bool hit;
+
+        if (*q == '\0')
+            hit = true;
+        else if (ci_contains(
+                     g_history.names[k], q))
+            hit = true;
+        else {
+            hit = false;
+
+            if (texts) {
+
+                unsigned char flags[
+                    MAX_MESSAGES];
+
+                int m = history_load(
+                    g_history.names[k],
+                    texts, flags,
+                    MAX_MESSAGES);
+
+                for (int i = 0;
+                     i < m && !hit;
+                     i++)
+                    hit = ci_contains(
+                        texts[i], q);
+            }
+        }
+
+        if (!hit)
+            continue;
+
+        snprintf(g_search_files[n],
+                 sizeof(g_search_files[0]),
+                 "%s", g_history.names[k]);
+
+        long t = atol(g_history.names[k]);
+
+        struct tm *tm = localtime(&t);
+
+        strftime(g_search_labels[n],
+                 sizeof(g_search_labels[0]),
+                 "%b %d %H:%M", tm);
+
+        n++;
+    }
+
+    free(texts);
+
+    /*
+        Empty state: one disabled-looking row.
+    */
+    if (n == 0) {
+
+        g_search_files[0][0] = '\0';
+
+        snprintf(g_search_labels[0],
+                 sizeof(g_search_labels[0]),
+                 *q ? "(no matches)"
+                    : "(no saved chats)");
+
+        n = 1;
+    }
+
+    const char *labels[POPUP_MAX_ITEMS];
+
+    for (int k = 0; k < n; k++)
+        labels[k] = g_search_labels[k];
+
+    popup_set_items(&searchPopup,
+                    labels, n);
+}
+
+static bool dispatch_chat(
+    AppState *state)
+{
+    /*
+        Build conversation history for context.
+    */
+    const char *roles[OLLAMA_HISTORY];
+    const char *contents[OLLAMA_HISTORY];
+
+    int start = state->count - OLLAMA_HISTORY;
+
+    if (start < 0) start = 0;
+
+    int n = 0;
+
+    for (int i = start; i < state->count; i++) {
+
+        /*
+            Skip synthetic assistant notes such
+            as "(Cannot reach Ollama ...)" —
+            they aren't real replies.
+        */
+        if (!state->messages[i].is_user &&
+            state->messages[i].text[0] == '(')
+            continue;
+
+        roles[n] =
+            state->messages[i].is_user
+            ? "user" : "assistant";
+        contents[n] = state->messages[i].text;
+        n++;
+    }
+
+    if (n == 0) {
+        /*
+            Nothing but synthetic notes.
+        */
+        return false;
+    }
+
+    char *body = ollama_build_body(
+        g_current_model, roles, contents, n);
+
+    if (!body) {
+        add_message(state,
+            "(Out of memory.)", false);
+        return false;
+    }
+
+    if (ollama_begin(body)) {
+        state->is_thinking = true;
+        return true;
+    }
+
+    free(body);
+
+    add_message(state,
+        "(Still answering the previous "
+        "message\u2026)", false);
+
+    return false;
+}
+
+static void send_user_message(
+    AppState *state,
+    const char *text)
+{
+    add_message(state, text, true);
+
+    /*
+        A fresh human turn resets the auto-heal
+        budget.
+    */
+    g_autoheal_attempts = 0;
+
+    dispatch_chat(state);
+}
+
+/*
+    Deliver a finished reply to the IPC client (if
+    any) and clear the routing slot.
+*/
+static void deliver_ipc_reply(const char *text)
+{
+    if (g_ipc_fd < 0)
+        return;
+
+    ipc_reply(g_ipc_fd, text);
+    g_ipc_fd = -1;
+}
+
+static int sidebar_item_at(
+    UISidebar *sb,
+    UIContext *ui,
+    int mx,
+    int my)
+{
+    if (!sb->open || sb->anim < 0.85f)
+        return -1;
+
+    for (int i = 0; i < SIDEBAR_ITEMS; i++) {
+
+        SDL_Rect row =
+            ui_rect(
+                ui,
+                SIDEBAR_ITEM_X,
+                SIDEBAR_ITEM_Y +
+                    i * SIDEBAR_ITEM_GAP,
+                SIDEBAR_ITEM_W,
+                SIDEBAR_ITEM_H
+            );
+
+        if (ui_point_in_rect(mx, my, row))
+            return i;
+    }
+
+    return -1;
+}
+
+/*
+    Rect of the sidebar's "Pair devices" button,
+    drawn just below the regular menu items.
+*/
+static SDL_Rect pair_row_rect(UIContext *ui)
+{
+    return ui_rect(ui,
+        SIDEBAR_ITEM_X,
+        SIDEBAR_ITEM_Y +
+            SIDEBAR_ITEMS * SIDEBAR_ITEM_GAP + 14.0f,
+        SIDEBAR_ITEM_W,
+        SIDEBAR_ITEM_H + 8.0f);
+}
+
+/*
+    Draw the sidebar pairing button + (when opened) a small
+    panel showing the host/port, the live pairing code and a
+    "New code" action.
+*/
+static int lan_ipv4(char *out, size_t out_size);
+
+static void draw_pair_controls(
+    SDL_Renderer *renderer, UIContext *ui,
+    TTF_Font *font, float sidebar_anim)
+{
+    if (!g_relay_ok || sidebar_anim < 0.8f)
+        return;
+
+    float alpha = (sidebar_anim - 0.8f) / 0.2f;
+    if (alpha > 1.0f) alpha = 1.0f;
+
+    relay_code(g_pair_code, sizeof(g_pair_code));
+
+    SDL_Rect row = pair_row_rect(ui);
+
+    int radius = (int)roundf(
+        SIDEBAR_ITEM_H * 0.5f * ui->scale);
+
+    ui_glass(renderer, row, radius, g_pair_box, ui->dark);
+
+    int nConnected = relay_paired_count();
+    char label[96];
+    if (nConnected > 0)
+        snprintf(label, sizeof(label),
+                 "Pair devices (%d)",
+                 nConnected);
+    else
+        snprintf(label, sizeof(label),
+                 "Pair devices");
+
+    UIColor lc = ui_theme(ui->dark,
+        (UIColor){25, 55, 130, 255},
+        (UIColor){140, 190, 255, 255});
+    lc.a = (Uint8)(lc.a * alpha);
+    ui_text(renderer, font, label,
+            row.x + (int)roundf(14.0f * ui->scale),
+            row.y + (row.h - TTF_FontHeight(font)) / 2,
+            lc);
+
+    if (!g_pair_box)
+        return;
+
+    /* Expanded panel below the button. Shows the scan-ready
+       QR code up top, then IP/port + code beneath it. */
+    SDL_Rect panel = {
+        row.x,
+        row.y + row.h + (int)roundf(8.0f * ui->scale),
+        row.w,
+        (int)roundf(288.0f * ui->scale)
+    };
+    ui_glass(renderer, panel, (int)roundf(14.0f * ui->scale),
+             false, ui->dark);
+
+    char ip[64] = "";
+    bool have_ip = lan_ipv4(ip, sizeof(ip));
+
+    /* Encode the pairing URI: sayri://<ip>:<port>?code=<code>
+       The Android app scans this and auto-connects. */
+    char uri[192];
+    snprintf(uri, sizeof(uri), "sayri://%s:%d?code=%s",
+             have_ip ? ip : "?.?.?.?", RELAY_PORT, g_pair_code);
+    qrsurface_set(uri);
+
+    int qrPx = (int)roundf(184.0f * ui->scale);
+    qrsurface_draw(renderer,
+        panel.x + (panel.w - qrPx) / 2,
+        panel.y + (int)roundf(10.0f * ui->scale),
+        qrPx,
+        (UIColor){25, 28, 40, 255},
+        (UIColor){250, 252, 255, 255});
+
+    char line[128];
+    snprintf(line, sizeof(line), "Scan with Sayri:");
+    ui_text(renderer, font, line,
+            panel.x + (int)roundf(14.0f * ui->scale),
+            panel.y + (int)roundf(204.0f * ui->scale),
+            ui_theme(ui->dark,
+                     (UIColor){80, 90, 110, 230},
+                     (UIColor){150, 158, 178, 230}));
+
+    char addr_line[160];
+    snprintf(addr_line, sizeof(addr_line),
+             "IP %s:%d",
+             have_ip ? ip : "?.?.?.?", RELAY_PORT);
+    ui_text(renderer, font, addr_line,
+            panel.x + (int)roundf(14.0f * ui->scale),
+            panel.y + (int)roundf(224.0f * ui->scale),
+            ui_theme(ui->dark,
+                     (UIColor){30, 40, 58, 255},
+                     (UIColor){205, 205, 212, 255}));
+
+    char code_line[128];
+    snprintf(code_line, sizeof(code_line),
+             "Code %s", g_pair_code);
+    ui_text(renderer, font, code_line,
+            panel.x + (int)roundf(14.0f * ui->scale),
+            panel.y + (int)roundf(244.0f * ui->scale),
+            ui_theme(ui->dark,
+                     (UIColor){30, 40, 58, 255},
+                     (UIColor){205, 205, 212, 255}));
+
+    char state_line[128];
+    if (nConnected > 0)
+        snprintf(state_line, sizeof(state_line),
+                 "%d device(s) linked", nConnected);
+    else
+        snprintf(state_line, sizeof(state_line),
+                 "Scan to pair.");
+    UIColor stc = ui_theme(ui->dark,
+        nConnected > 0 ? (UIColor){20, 120, 70, 220}
+                       : (UIColor){80, 90, 110, 200},
+        nConnected > 0 ? (UIColor){120, 220, 160, 220}
+                       : (UIColor){160, 168, 185, 200});
+    ui_text(renderer, font, state_line,
+            panel.x + (int)roundf(14.0f * ui->scale),
+            panel.y + (int)roundf(264.0f * ui->scale), stc);
+}
+
+/*
+    Store the first private IPv4 address of this machine (the one a
+    phone on the same LAN uses to reach the relay) in out.
+    Returns 1 on success, 0 if none found.
+*/
+static int lan_ipv4(char *out, size_t out_size)
+{
+    struct ifaddrs *ifa0 = NULL;
+    if (getifaddrs(&ifa0) != 0)
+        return 0;
+
+    int found = 0;
+    for (struct ifaddrs *ifa = ifa0; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr ||
+            ifa->ifa_addr->sa_family != AF_INET)
+            continue;
+        if (!(ifa->ifa_flags & IFF_UP))
+            continue;
+        struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
+        unsigned long ip = ntohl(sa->sin_addr.s_addr);
+        bool private_net =
+            (ip >> 24) == 10 ||                                   /* 10.x.x.x  */
+            (((ip >> 16) & 0xff) == 172 && ((ip >> 8) & 0xf0) == 16) || /* 172.16-31 */
+            (((ip >> 24) == 192) && ((ip >> 16) & 0xff) == 168);  /* 192.168.x */
+        if (private_net &&
+            strcmp(ifa->ifa_name, "lo") != 0) {
+            snprintf(out, out_size, "%s",
+                     inet_ntoa(sa->sin_addr));
+            found = 1;
+            break;
+        }
+    }
+    freeifaddrs(ifa0);
+    return found;
+}
+
+#define CHAT_WRAP_LINES 24
+#define CHAT_LINE_CAP 512
+
+/*
+    Word-wrap text into lines that fit max_w.
+    Honors explicit newlines. Returns line count;
+    output is truncated at max_lines with an
+    ellipsis.
+*/
+static int wrap_lines(
+    TTF_Font *font,
+    const char *text,
+    int max_w,
+    char out[][CHAT_LINE_CAP],
+    int max_lines)
+{
+    int count = 0;
+
+    out[0][0] = '\0';
+
+    const char *p = text;
+
+    while (*p) {
+
+        /*
+            One paragraph per explicit newline.
+        */
+        const char *nl = strchr(p, '\n');
+
+        size_t seg_len =
+            nl ? (size_t)(nl - p)
+               : strlen(p);
+
+        char seg[CHAT_LINE_CAP];
+
+        snprintf(seg, sizeof(seg),
+                 "%.*s", (int)seg_len, p);
+
+        char *save = NULL;
+
+        for (char *word =
+                strtok_r(seg, " ", &save);
+             word;
+             word = strtok_r(NULL, " ", &save)) {
+
+            char candidate[CHAT_LINE_CAP];
+            int cur_len =
+                (int)strlen(out[count]);
+
+            snprintf(candidate,
+                     sizeof(candidate),
+                     "%s%s%s",
+                     out[count],
+                     cur_len ? " " : "",
+                     word);
+
+            int w = 0;
+            TTF_SizeUTF8(font, candidate,
+                         &w, NULL);
+
+            if (cur_len == 0 || w <= max_w) {
+                snprintf(out[count],
+                         sizeof(out[count]),
+                         "%s", candidate);
+
+            } else {
+
+                if (count + 1 >= max_lines) {
+                    size_t len =
+                        strlen(out[count]);
+                    snprintf(
+                        out[count] + len,
+                        sizeof(out[count]) - len,
+                        "\u2026");
+                    return count + 1;
+                }
+
+                count++;
+                snprintf(out[count],
+                         sizeof(out[count]),
+                         "%s", word);
+            }
+        }
+
+        if (!nl)
+            break;
+
+        p = nl + 1;
+
+        if (*p && count + 1 < max_lines) {
+            count++;
+            out[count][0] = '\0';
+        } else if (!*p) {
+            break;
+        }
+    }
+
+    return count + 1;
+}
+
+/* ============================================================
+   Chat bubble geometry (shared by rendering + hit-testing)
+   ============================================================ */
+
+typedef struct {
+    int x, y, w, h;
+    int pad;
+    int msgH;
+    int msgGap;
+    int maxBubbleW;
+    int textPad;
+    int linePad;
+    int padV;
+} ChatGeo;
+
+static ChatGeo chat_geo(
+    UIContext *ui,
+    int x, int y, int w, int h)
+{
+    ChatGeo g;
+    g.x = x;
+    g.y = y;
+    g.w = w;
+    g.h = h;
+    g.pad = (int)roundf(14.0f * ui->scale);
+    g.msgH = (int)roundf(38.0f * ui->scale);
+    g.msgGap = (int)roundf(6.0f * ui->scale);
+    g.maxBubbleW = w - g.pad * 2 -
+        (int)roundf(40.0f * ui->scale);
+    g.textPad = (int)roundf(12.0f * ui->scale);
+    g.linePad = (int)roundf(3.0f * ui->scale);
+    g.padV = (int)roundf(9.0f * ui->scale);
+    return g;
+}
+
+static void chat_bubble_metrics(
+    TTF_Font *font,
+    const ChatGeo *g,
+    const ChatMessage *m,
+    int *out_w,
+    int *out_h)
+{
+    int bubbleW =
+        m->is_user
+        ? (int)(g->maxBubbleW * 0.60f)
+        : (int)(g->maxBubbleW * 0.75f);
+
+    if (bubbleW < 60) bubbleW = 60;
+
+    char lines[CHAT_WRAP_LINES][CHAT_LINE_CAP];
+
+    int lineCount =
+        wrap_lines(
+            font, m->text,
+            bubbleW - g->textPad * 2,
+            lines, CHAT_WRAP_LINES);
+
+    int fontH = TTF_FontHeight(font);
+
+    int bubbleH =
+        lineCount * (fontH + g->linePad) +
+        g->padV * 2;
+
+    if (bubbleH < g->msgH)
+        bubbleH = g->msgH;
+
+    if (out_w) *out_w = bubbleW;
+    if (out_h) *out_h = bubbleH;
+}
+
+static SDL_Rect chat_bubble_rect(
+    TTF_Font *font,
+    const ChatGeo *g,
+    const AppState *state,
+    int i)
+{
+    const ChatMessage *m = &state->messages[i];
+
+    int bubbleW, bubbleH;
+    chat_bubble_metrics(font, g, m, &bubbleW, &bubbleH);
+
+    int bubbleX =
+        m->is_user
+        ? g->x + g->w - g->pad - bubbleW
+        : g->x + g->pad;
+
+    int curY =
+        g->y + g->h - g->pad +
+        (int)state->scroll_offset;
+
+    for (int k = state->count - 1; k >= i; k--) {
+        const ChatMessage *mk = &state->messages[k];
+
+        int wk, hk;
+        chat_bubble_metrics(font, g, mk, &wk, &hk);
+
+        curY -= hk + g->msgGap;
+
+        if (k == i) {
+            int bubbleY =
+                curY +
+                (int)(m->slide_y * (1.0f - m->alpha));
+
+            return (SDL_Rect){
+                bubbleX, bubbleY,
+                bubbleW, bubbleH};
+        }
+    }
+
+    return (SDL_Rect){0, 0, 0, 0};
+}
+
+/*
+    Chat panel rectangle for the current window
+    layout.
+*/
+static SDL_Rect chat_area_rect(
+    UIContext *ui,
+    const UISidebar *sb,
+    int width, int height)
+{
+    int pad = (int)roundf(14.0f * ui->scale);
+    int inputBarH = (int)roundf(42.0f * ui->scale);
+    int sbPx = (int)(
+        ui_ease_out_cubic(sb->anim) *
+        260.0f * ui->scale);
+
+    int chatTop = pad;
+    int chatBottom = height - pad - inputBarH - pad;
+
+    int chatH = chatBottom - chatTop;
+    if (chatH < 80) chatH = 80;
+
+    return (SDL_Rect){
+        sbPx + pad, chatTop,
+        width - sbPx - pad * 2, chatH};
+}
+
+/*
+    First visible message whose bubble contains
+    the given point.
+*/
+static int chat_bubble_at(
+    TTF_Font *font,
+    const ChatGeo *g,
+    const AppState *state,
+    int mx, int my)
+{
+    for (int i = state->count - 1; i >= 0; i--) {
+        const ChatMessage *m = &state->messages[i];
+        if (m->alpha < 0.01f) continue;
+
+        SDL_Rect b =
+            chat_bubble_rect(font, g, state, i);
+
+        if (ui_point_in_rect(mx, my, b))
+            return i;
+    }
+
+    return -1;
+}
+
+/* ============================================================
+   Bubble tap ripple
+
+   Faithful CPU port of test/ripple.c: the bubble is warped
+   pixel-by-pixel by a damped radial sine wave.
+
+     ripple    = amplitude * sin(freq * t') * exp(-decay * t')
+     t'        = max(0, u_time - dist / u_speed)
+     output    = texture(local + ripple * n)          (displacement)
+     color.rgb += 0.3 * (ripple / amplitude) * a       (brightness)
+
+   The already-rendered bubble is read back from the
+   framebuffer, warped, and drawn back in its place.
+   ============================================================ */
+
+static void clear_bubble_ripples(void)
+{
+    for (int k = 0; k < MAX_BUBBLE_RIPPLES; k++) {
+        free(g_ripples[k].snap);
+        g_ripples[k].snap = NULL;
+        g_ripples[k].active = false;
+    }
+}
+
+static void spawn_bubble_ripple(
+    int mx, int my, int msg_index)
+{
+    Uint64 now = SDL_GetTicks64();
+
+    int slot = -1;
+    Uint64 oldest = now;
+
+    for (int k = 0; k < MAX_BUBBLE_RIPPLES; k++) {
+        if (!g_ripples[k].active) {
+            slot = k;
+            break;
+        }
+        if (g_ripples[k].startMs < oldest) {
+            oldest = g_ripples[k].startMs;
+            slot = k;
+        }
+    }
+
+    if (slot < 0) return;
+
+    BubbleRipple *r = &g_ripples[slot];
+    r->active = true;
+    r->msg_index = msg_index;
+    r->ox = (float)mx;
+    r->oy = (float)my;
+    r->amplitude = 28.0f;
+    r->startMs = now;
+    r->snap = NULL;
+    r->snap_w = 0;
+    r->snap_h = 0;
+}
+
+/*
+    Coverage ramp for the bubble's rounded-corner
+    shape, mirroring the u_corner SDF in
+    test/ripple.c: output pixels outside the rounded
+    rect carry zero alpha.
+*/
+static float rounded_rect_cov(
+    SDL_Rect b,
+    float radius,
+    float px, float py)
+{
+    float hw = (float)b.w * 0.5f;
+    float hh = (float)b.h * 0.5f;
+    float cx = (float)b.x + hw;
+    float cy = (float)b.y + hh;
+
+    float qx = fabsf(px - cx) - (hw - radius);
+    float qy = fabsf(py - cy) - (hh - radius);
+
+    float ox = qx > 0.0f ? qx : 0.0f;
+    float oy = qy > 0.0f ? qy : 0.0f;
+
+    float outside =
+        sqrtf(ox * ox + oy * oy) +
+        fminf(fmaxf(qx, qy), 0.0f) - radius;
+
+    float cov = 0.5f - outside;
+    if (cov > 1.0f) cov = 1.0f;
+    if (cov < 0.0f) cov = 0.0f;
+    return cov;
+}
+
+/*
+    Reusable storage for the ripple warp (grows to
+    the biggest bubble seen).
+*/
+static SDL_Texture *g_rip_tex = NULL;
+static int g_rip_tex_w = 0;
+static int g_rip_tex_h = 0;
+static Uint32 *g_rip_out = NULL;
+static int g_rip_out_alloc = 0;
+
+static void ripple_free_storage(void)
+{
+    if (g_rip_tex) {
+        SDL_DestroyTexture(g_rip_tex);
+        g_rip_tex = NULL;
+    }
+    free(g_rip_out);
+    g_rip_out = NULL;
+    g_rip_out_alloc = 0;
+    g_rip_tex_w = 0;
+    g_rip_tex_h = 0;
+
+    for (int k = 0; k < MAX_BUBBLE_RIPPLES; k++) {
+        free(g_ripples[k].snap);
+        g_ripples[k].snap = NULL;
+    }
+}
+
+/*
+    Bilinear tap into the read-back bubble pixels
+    (ARGB8888). Mirrors GL_LINEAR sampling.
+*/
+static Uint32 ripple_sample_bilinear(
+    const Uint32 *px, int w, int h,
+    float x, float y)
+{
+    if (x < 0.0f) x = 0.0f;
+    else if (x > (float)(w - 1)) x = (float)(w - 1);
+    if (y < 0.0f) y = 0.0f;
+    else if (y > (float)(h - 1)) y = (float)(h - 1);
+
+    int x0 = (int)x;
+    int y0 = (int)y;
+    int x1 = x0 + 1 < w ? x0 + 1 : x0;
+    int y1 = y0 + 1 < h ? y0 + 1 : y0;
+
+    float fx = x - (float)x0;
+    float fy = y - (float)y0;
+
+    Uint32 c00 = px[y0 * w + x0];
+    Uint32 c01 = px[y0 * w + x1];
+    Uint32 c10 = px[y1 * w + x0];
+    Uint32 c11 = px[y1 * w + x1];
+
+    float r =
+        (float)((c00 >> 16) & 255) * (1.0f - fx) * (1.0f - fy) +
+        (float)((c01 >> 16) & 255) * fx * (1.0f - fy) +
+        (float)((c10 >> 16) & 255) * (1.0f - fx) * fy +
+        (float)((c11 >> 16) & 255) * fx * fy;
+    float g =
+        (float)((c00 >> 8) & 255) * (1.0f - fx) * (1.0f - fy) +
+        (float)((c01 >> 8) & 255) * fx * (1.0f - fy) +
+        (float)((c10 >> 8) & 255) * (1.0f - fx) * fy +
+        (float)((c11 >> 8) & 255) * fx * fy;
+    float b =
+        (float)(c00 & 255) * (1.0f - fx) * (1.0f - fy) +
+        (float)(c01 & 255) * fx * (1.0f - fy) +
+        (float)(c10 & 255) * (1.0f - fx) * fy +
+        (float)(c11 & 255) * fx * fy;
+
+    return 0xFF000000u |
+        ((Uint32)(r + 0.5f) << 16) |
+        ((Uint32)(g + 0.5f) << 8) |
+        (Uint32)(b + 0.5f);
+}
+
+/*
+    Compute the shader pixel for one ripple.
+*/
+static Uint32 ripple_pixel(
+    const Uint32 *src, int pw, int ph,
+    float px, float py,
+    int ox, int oy,
+    float t, float speedInv,
+    SDL_Rect bubble, float corner)
+{
+    float dx = px - (float)ox;
+    float dy = py - (float)oy;
+    float dist = sqrtf(dx * dx + dy * dy);
+
+    float local = t - dist * speedInv;
+
+    Uint32 out;
+
+    if (local <= 0.0f) {
+        /* Wave has not arrived yet: untouched. */
+        int ix = (int)(px - (float)bubble.x);
+        int iy = (int)(py - (float)bubble.y);
+        if (ix < 0) ix = 0;
+        if (iy < 0) iy = 0;
+        if (ix > pw - 1) ix = pw - 1;
+        if (iy > ph - 1) iy = ph - 1;
+        out = src[iy * pw + ix];
+    } else {
+        float ripple =
+            28.0f * sinf(15.0f * local) *
+            expf(-8.0f * local);
+
+        float nx = dist > 0.001f ? dx / dist : 0.0f;
+        float ny = dist > 0.001f ? dy / dist : 0.0f;
+
+        /* texture(local + ripple * n) */
+        Uint32 s = ripple_sample_bilinear(
+            src, pw, ph,
+            px + ripple * nx - (float)bubble.x,
+            py + ripple * ny - (float)bubble.y);
+
+        /* color.rgb += 0.3 * (ripple / amplitude) * a */
+        float sa = (float)((s >> 24) & 255);
+        float bright =
+            0.3f * (ripple / 28.0f) * (sa / 255.0f);
+
+        float r = (float)((s >> 16) & 255) + bright;
+        float g = (float)((s >> 8) & 255) + bright;
+        float b = (float)(s & 255) + bright;
+
+        if (r < 0.0f) r = 0.0f; else if (r > 255.0f) r = 255.0f;
+        if (g < 0.0f) g = 0.0f; else if (g > 255.0f) g = 255.0f;
+        if (b < 0.0f) b = 0.0f; else if (b > 255.0f) b = 255.0f;
+
+        out =
+            ((Uint32)(r + 0.5f) << 16) |
+            ((Uint32)(g + 0.5f) << 8) |
+            (Uint32)(b + 0.5f);
+    }
+
+    float cov = rounded_rect_cov(bubble, corner, px, py);
+
+    Uint32 a = (Uint32)(cov * 255.0f + 0.5f);
+    if (a > 255) a = 255;
+
+    return (a << 24) | (out & 0x00FFFFFFu);
+}
+
+/*
+    Warp one bubble for all of its active ripples and
+    draw the result back over it. Exact port of
+    ripple_draw() from test/ripple.c: read the rendered
+    bubble back, displace it, add the wave brightness.
+*/
+static void draw_bubble_ripples(
+    SDL_Renderer *renderer,
+    UIContext *ui,
+    SDL_Rect bubble,
+    int msg_index)
+{
+    Uint64 now = SDL_GetTicks64();
+
+    const float speed = 1200.0f;
+    const float speedInv = 1.0f / speed;
+    const float corner =
+        (float)roundf(14.0f * ui->scale);
+
+    BubbleRipple *cur = NULL;
+    float t = 0.0f;
+    int ox = 0, oy = 0;
+
+    for (int k = 0; k < MAX_BUBBLE_RIPPLES; k++) {
+        BubbleRipple *r = &g_ripples[k];
+        if (!r->active || r->msg_index != msg_index)
+            continue;
+
+        double ms = (double)(now - r->startMs);
+        float tt = (float)(ms / 1000.0);
+
+        if (tt >= RIPPLE_DURATION) {
+            /* Expired: reclaim the snapshot. */
+            free(r->snap);
+            r->snap = NULL;
+            r->active = false;
+            continue;
+        }
+
+        if (tt <= 0.0f)
+            continue;
+
+        cur = r;
+        t = tt;
+        ox = (int)r->ox;
+        oy = (int)r->oy;
+        break;
+    }
+
+    if (!cur)
+        return;
+
+    if (bubble.w < 1 || bubble.h < 1)
+        return;
+
+    int pw = bubble.w;
+    int ph = bubble.h;
+
+    /*
+        Large bubbles are warped at half resolution:
+        the wave is soft, and this keeps the extra
+        CPU cost of the correction bounded.
+    */
+    int stride = (pw * ph > 90000) ? 2 : 1;
+    int ow = (pw + stride - 1) / stride;
+    int oh = (ph + stride - 1) / stride;
+
+    if (ow * oh > g_rip_out_alloc) {
+        Uint32 *nb = realloc(
+            g_rip_out, (size_t)(ow * oh) * sizeof(Uint32));
+        if (!nb) return;
+        g_rip_out = nb;
+        g_rip_out_alloc = ow * oh;
+    }
+
+    /*
+        First frame only: snapshot the freshly-rendered,
+        pristine bubble. Every later frame warps this
+        snapshot, never the previous warped output.
+    */
+    if (cur->snap == NULL ||
+        cur->snap_w != pw ||
+        cur->snap_h != ph) {
+
+        Uint32 *nb = realloc(
+            cur->snap,
+            (size_t)(pw * ph) * sizeof(Uint32));
+        if (!nb) return;
+
+        cur->snap = nb;
+        cur->snap_w = pw;
+        cur->snap_h = ph;
+
+        if (SDL_RenderReadPixels(
+                renderer, &bubble,
+                SDL_PIXELFORMAT_ARGB8888,
+                cur->snap,
+                pw * 4) != 0)
+            return;
+    }
+
+    const Uint32 *src = cur->snap;
+    Uint32 *dst = g_rip_out;
+
+    for (int sy = 0; sy < oh; sy++) {
+        float py =
+            (float)(bubble.y + sy * stride);
+
+        for (int sx = 0; sx < ow; sx++) {
+            float px =
+                (float)(bubble.x + sx * stride);
+
+            dst[sy * ow + sx] = ripple_pixel(
+                src, pw, ph, px, py,
+                ox, oy, t, speedInv,
+                bubble, corner);
+        }
+    }
+
+    if (!g_rip_tex ||
+        g_rip_tex_w != ow || g_rip_tex_h != oh) {
+        if (g_rip_tex)
+            SDL_DestroyTexture(g_rip_tex);
+
+        g_rip_tex = SDL_CreateTexture(
+            renderer, SDL_PIXELFORMAT_ARGB8888,
+            SDL_TEXTUREACCESS_STREAMING, ow, oh);
+
+        g_rip_tex_w = ow;
+        g_rip_tex_h = oh;
+    }
+
+    if (!g_rip_tex)
+        return;
+
+    SDL_UpdateTexture(
+        g_rip_tex, NULL, dst, ow * 4);
+
+    SDL_SetTextureBlendMode(
+        g_rip_tex, SDL_BLENDMODE_BLEND);
+
+    SDL_SetHint(
+        SDL_HINT_RENDER_SCALE_QUALITY, "1");
+    SDL_RenderCopy(
+        renderer, g_rip_tex, NULL, &bubble);
+    SDL_SetHint(
+        SDL_HINT_RENDER_SCALE_QUALITY, "0");
+}
+
+static void draw_chat_area(
+    SDL_Renderer *renderer,
+    AppState *state,
+    UIContext *ui,
+    TTF_Font *font,
+    int x, int y, int w, int h)
+{
+    SDL_Rect container = {x, y, w, h};
+
+    ui_fill_rounded_rect(
+        renderer, container,
+        (int)roundf(18.0f * ui->scale),
+        ui->dark
+        ? (UIColor){26, 26, 29, 190}
+        : (UIColor){240, 245, 252, 175});
+
+    SDL_RenderSetClipRect(renderer, &container);
+
+    ChatGeo geo = chat_geo(ui, x, y, w, h);
+
+    for (int i = state->count - 1; i >= 0; i--) {
+
+        ChatMessage *m = &state->messages[i];
+        if (m->alpha < 0.01f) continue;
+
+        SDL_Rect bubble =
+            chat_bubble_rect(font, &geo, state, i);
+
+        Uint8 bgA =
+            (Uint8)(180.0f * m->alpha);
+
+        if (m->is_user) {
+            ui_fill_rounded_rect(
+                renderer, bubble,
+                (int)roundf(14.0f * ui->scale),
+                ui->dark
+                ? (UIColor){62, 62, 70, bgA}
+                : (UIColor){200, 210, 240, bgA});
+        } else {
+            ui_fill_rounded_rect(
+                renderer, bubble,
+                (int)roundf(14.0f * ui->scale),
+                ui->dark
+                ? (UIColor){44, 44, 49, bgA}
+                : (UIColor){230, 235, 248, bgA});
+        }
+
+        /*
+            Wrap into lines that fit the bubble.
+        */
+        char lines[CHAT_WRAP_LINES][CHAT_LINE_CAP];
+
+        int lineCount =
+            wrap_lines(
+                font, m->text,
+                bubble.w - geo.textPad * 2,
+                lines, CHAT_WRAP_LINES);
+
+        int fontH = TTF_FontHeight(font);
+        int lineH = fontH + geo.linePad;
+
+        Uint8 tA =
+            (Uint8)(230.0f * m->alpha);
+
+        int textY = bubble.y +
+            (bubble.h - lineCount * lineH) / 2;
+
+        UIColor textColor =
+            m->is_user
+            ? ui_theme(ui->dark,
+                  (UIColor){35, 45, 80, tA},
+                  (UIColor){225, 232, 250, tA})
+            : ui_theme(ui->dark,
+                  (UIColor){50, 55, 85, tA},
+                  (UIColor){208, 216, 236, tA});
+
+        for (int k = 0; k < lineCount; k++) {
+            ui_text(
+                renderer, font, lines[k],
+                bubble.x + geo.textPad,
+                textY + k * lineH,
+                textColor);
+        }
+
+        /*
+            Ripple overlay for taps on this bubble.
+        */
+        draw_bubble_ripples(
+            renderer, ui, bubble, i);
+
+        SDL_RenderSetClipRect(renderer, &container);
+    }
+
+    SDL_RenderSetClipRect(renderer, NULL);
+}
+
+static void draw_input_bar(
+    SDL_Renderer *renderer,
+    AppState *state,
+    UIContext *ui,
+    TTF_Font *font,
+    int x, int y, int w, int h,
+    float time)
+{
+    SDL_Rect bar = {x, y, w, h};
+
+    ui_fill_rounded_rect(
+        renderer, bar,
+        (int)roundf(14.0f * ui->scale),
+        state->input_focused
+        ? ui_theme(ui->dark,
+              (UIColor){246, 250, 255, 205},
+              (UIColor){40, 40, 45, 215})
+        : ui_theme(ui->dark,
+              (UIColor){240, 245, 252, 175},
+              (UIColor){24, 24, 27, 185}));
+
+    int pad =
+        (int)roundf(14.0f * ui->scale);
+
+    if (state->input_len > 0) {
+        ui_text(
+            renderer, font, state->input,
+            x + pad,
+            y + (h - (int)roundf(
+                17.0f * ui->scale)) / 2,
+            ui_theme(ui->dark,
+                (UIColor){30, 35, 60, 255},
+                (UIColor){220, 228, 245, 255}));
+    } else {
+        ui_text(
+            renderer, font,
+            "Ask Sayri\u2026",
+            x + pad,
+            y + (h - (int)roundf(
+                17.0f * ui->scale)) / 2,
+            ui_theme(ui->dark,
+                (UIColor){140, 145, 170, 180},
+                (UIColor){125, 133, 158, 180}));
+    }
+
+    if (state->input_focused) {
+        float blink =
+            fmodf(
+                (float)SDL_GetTicks() / 1000.0f,
+                1.0f);
+
+        if (blink < 0.5f) {
+            int textW = 0;
+            if (state->input_len > 0)
+                TTF_SizeUTF8(
+                    font, state->input,
+                    &textW, NULL);
+
+            int cx = x + pad + textW + 2;
+            int ch = (int)roundf(16.0f * ui->scale);
+
+            float ct = fmodf(time * 2.0f, 4.0f);
+            UIColor cc;
+            UIColor c1 = {110, 140, 235, 255};
+            UIColor c2 = {230, 130, 195, 255};
+            UIColor c3 = {170, 140, 220, 255};
+            UIColor c4 = {100, 200, 185, 255};
+
+            if (ct < 1.0f)
+                cc = lerp_color(c1, c2, ct);
+            else if (ct < 2.0f)
+                cc = lerp_color(c2, c3, ct - 1.0f);
+            else if (ct < 3.0f)
+                cc = lerp_color(c3, c4, ct - 2.0f);
+            else
+                cc = lerp_color(c4, c1, ct - 3.0f);
+
+            cc.a = 230;
+
+            SDL_SetRenderDrawBlendMode(
+                renderer, SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(
+                renderer,
+                cc.r, cc.g, cc.b, cc.a);
+            SDL_RenderDrawLine(
+                renderer,
+                cx, y + (h - ch) / 2,
+                cx, y + (h + ch) / 2);
+        }
+    }
+}
+
+static void draw_send_button(
+    SDL_Renderer *renderer,
+    AppState *state,
+    UIContext *ui,
+    TTF_Font *font,
+    int x, int y, int size)
+{
+    bool has = state->input_len > 0;
+
+    int r = size / 2;
+
+    if (has) {
+        ui_fill_circle(
+            renderer,
+            x + size / 2, y + size / 2, r,
+            (UIColor){70, 130, 255, 255});
+        ui_fill_circle(
+            renderer,
+            x + size / 2, y + size / 2,
+            r + 4,
+            (UIColor){70, 130, 255, 35});
+    } else {
+        ui_fill_circle(
+            renderer,
+            x + size / 2, y + size / 2, r,
+            ui_theme(ui->dark,
+                (UIColor){200, 205, 220, 150},
+                (UIColor){70, 78, 98, 170}));
+    }
+
+    const char *arrow = "\u2191";
+    int tw = 0, th = 0;
+    TTF_SizeUTF8(font, arrow, &tw, &th);
+
+    ui_text(
+        renderer, font, arrow,
+        x + (size - tw) / 2,
+        y + (size - th) / 2,
+        (UIColor){255, 255, 255,
+                  has ? 255 : 100});
+}
+
+
+static void draw_background(
+    SDL_Renderer *renderer,
+    UIContext *ui,
+    int width, int height, float time)
+{
+    bool dark = ui->dark;
+
+    for (int y = 0; y < height; ++y) {
+        float t =
+            (float)y / (float)(height - 1);
+
+        Uint8 r = dark
+            ? (Uint8)(16 + t * 10.0f)
+            : (Uint8)(205 + t * 25.0f);
+        Uint8 g = dark
+            ? (Uint8)(18 + t * 10.0f)
+            : (Uint8)(215 + t * 18.0f);
+        Uint8 b = dark
+            ? (Uint8)(28 + t * 12.0f)
+            : (Uint8)(242 - t * 5.0f);
+
+        SDL_SetRenderDrawColor(
+            renderer, r, g, b, 255);
+        SDL_RenderDrawLine(
+            renderer, 0, y, width - 1, y);
+    }
+
+    float orbA = dark ? 0.45f : 1.0f;
+
+    float t1 = time * 0.15f;
+    float t2 = time * 0.12f + 2.0f;
+    float t3 = time * 0.18f + 4.0f;
+
+    ui_fill_radial_gradient(
+        renderer,
+        (int)(width * 0.55f + sinf(t1) * 60.0f),
+        (int)(height * 0.25f + cosf(t1 * 0.7f) * 40.0f),
+        (int)(width * 0.28f),
+        (UIColor){110, 140, 235,
+                  (Uint8)(90 * orbA)},
+        (UIColor){110, 140, 235, 0});
+
+    ui_fill_radial_gradient(
+        renderer,
+        (int)(width * 0.72f + cosf(t2) * 50.0f),
+        (int)(height * 0.70f + sinf(t2 * 0.8f) * 35.0f),
+        (int)(width * 0.22f),
+        (UIColor){230, 130, 195,
+                  (Uint8)(80 * orbA)},
+        (UIColor){230, 130, 195, 0});
+
+    ui_fill_radial_gradient(
+        renderer,
+        (int)(width * 0.38f + sinf(t3 * 0.6f) * 45.0f),
+        (int)(height * 0.60f + cosf(t3) * 30.0f),
+        (int)(width * 0.18f),
+        (UIColor){100, 200, 185,
+                  (Uint8)(70 * orbA)},
+        (UIColor){100, 200, 185, 0});
+
+    ui_fill_radial_gradient(
+        renderer,
+        (int)(width * 0.85f + sinf(t1 * 0.9f) * 35.0f),
+        (int)(height * 0.15f + cosf(t2 * 0.5f) * 25.0f),
+        (int)(width * 0.15f),
+        (UIColor){170, 140, 220,
+                  (Uint8)(55 * orbA)},
+        (UIColor){170, 140, 220, 0});
+}
+
+int main(void)
+{
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        fprintf(stderr, "%s\n", SDL_GetError());
+        return 1;
+    }
+
+    SDL_StartTextInput();
+
+    if (TTF_Init() != 0) {
+        fprintf(stderr, "%s\n", TTF_GetError());
+        SDL_Quit();
+        return 1;
+    }
+
+    SDL_Window *window =
+        SDL_CreateWindow(
+            "Sayri",
+            SDL_WINDOWPOS_CENTERED,
+            SDL_WINDOWPOS_CENTERED,
+            1280, 720,
+            SDL_WINDOW_SHOWN |
+            SDL_WINDOW_RESIZABLE);
+
+    SDL_SetHint(
+        SDL_HINT_RENDER_SCALE_QUALITY,
+        "1");
+
+    SDL_Renderer *renderer =
+        SDL_CreateRenderer(
+            window, -1,
+            SDL_RENDERER_ACCELERATED |
+            SDL_RENDERER_PRESENTVSYNC);
+
+    if (!window || !renderer)
+        return 1;
+
+    /*
+        Window icon: sayri.png next to the
+        executable, so the path survives any
+        working directory.
+    */
+    {
+        char icon_path[512];
+
+        ssize_t ilen =
+            readlink(
+                "/proc/self/exe",
+                icon_path,
+                sizeof(icon_path) - 32);
+
+        if (ilen > 0) {
+            icon_path[ilen] = '\0';
+
+            char *slash =
+                strrchr(icon_path, '/');
+
+            if (slash)
+                slash[1] = '\0';
+
+            strcat(icon_path, "sayri.png");
+        } else {
+            snprintf(icon_path,
+                     sizeof(icon_path),
+                     "sayri.png");
+        }
+
+        SDL_Surface *icon =
+            IMG_Load(icon_path);
+
+        if (icon) {
+            SDL_SetWindowIcon(window, icon);
+            SDL_FreeSurface(icon);
+        }
+    }
+
+    char *fontPath = find_font();
+    if (!fontPath) {
+        printf("Put a .ttf in ./font/\n");
+        return 1;
+    }
+
+    /*
+        All text uses one typeface. Hierarchy
+        comes from size and color only —
+        synthetic bold distorts glyph shapes
+        enough to look like a different font.
+    */
+    if (strlen(fontPath) >=
+            sizeof(g_font_path)) {
+        printf("Font path too long\n");
+        return 1;
+    }
+
+    snprintf(g_font_path,
+             sizeof(g_font_path),
+             "%s", fontPath);
+
+    free(fontPath);
+
+    /*
+        Point sizes are design units: fonts are
+        re-rasterized at the effective ui scale,
+        so glyphs stay vector-crisp and keep
+        their proportion to the chrome at any
+        window size instead of being fixed-size
+        bitmaps that look chunky next to scaled
+        widgets.
+    */
+    int win_w0, win_h0;
+
+    SDL_GetWindowSize(
+        window, &win_w0, &win_h0);
+
+    UIContext ui0;
+    ui0.dark = false;
+
+    ui_begin(&ui0, win_w0, win_h0);
+
+    float loaded_scale = ui0.scale;
+
+    Fonts fonts;
+
+    if (!load_fonts(&fonts,
+                    loaded_scale)) {
+        printf("Could not load font\n");
+        return 1;
+    }
+
+    TTF_Font *font = fonts.font;
+    TTF_Font *titleFont = fonts.titleFont;
+    TTF_Font *smallFont = fonts.smallFont;
+    TTF_Font *boldFont = fonts.boldFont;
+    TTF_Font *menuFont = fonts.menuFont;
+
+    /*
+        Loaded for role completeness but not
+        referenced by any widget yet.
+    */
+    (void)titleFont;
+    (void)smallFont;
+
+    AppState state;
+    memset(&state, 0, sizeof(state));
+    state.input_focused = true;
+
+    add_message(&state,
+        "Hi, I'm Sayri. How can I help?", false);
+
+    UIContext ui;
+    ui.dark = false;
+
+    UIHamburger hamburger;
+    hamburger_init(&hamburger);
+
+    UISidebar sidebar;
+    sidebar_init(&sidebar);
+
+    /*
+        Sayri-specific menu labels.
+    */
+    sidebar.items[0] = "New Chat";
+    sidebar.items[1] = "Recents";
+    sidebar.items[2] = "Search";
+    sidebar.items[3] = "Downloads";
+    sidebar.items[4] = "Settings";
+
+    Orb orb;
+    orb_init(&orb, renderer);
+
+    ollama_init(OLLAMA_MODEL);
+
+    UIToggle darkToggle;
+    toggle_init(&darkToggle, false);
+
+    UIPopup settings;
+    popup_init(&settings, "Settings");
+    popup_set_row_label(&settings, "Dark Mode");
+    popup_link_toggle(&settings, &darkToggle);
+
+    UIDropDown modelDropdown;
+    dropdown_init(&modelDropdown);
+    popup_link_dropdown(
+        &settings, &modelDropdown);
+
+    UIPopup recentsPopup;
+    popup_init(&recentsPopup, "Recents");
+
+    popup_init(&searchPopup, "Search");
+    searchbar_init(&searchInput);
+    popup_link_search(
+        &searchPopup, &searchInput);
+
+    UIDownloads dlPanel;
+    downloads_init(&dlPanel, "llama3.2");
+
+    ollama_init(g_current_model);
+
+    /*
+        Zero-config start: make sure the
+        runtime is installed, the server is
+        running and the model exists — all in
+        the background, before the first
+        message needs it.
+    */
+    ollama_setup_begin(g_current_model);
+
+    /*
+        IPC socket: lets a GNOME extension (or any
+        local client) message this running app and
+        read back the assistant's reply.
+    */
+    {
+        char ipc_path[256] = "";
+        if (ipc_start(ipc_path, sizeof(ipc_path)) == 0)
+            printf("Sayri IPC socket: %s\n", ipc_path);
+        else
+            printf("Sayri IPC socket unavailable\n");
+    }
+
+    /*
+        Relay: let a paired phone stream the AI out
+        of this desktop (the phone can't run Ollama).
+        Always on; prints the pairing code to console.
+    */
+    {
+        if (relay_start() == 0) {
+            g_relay_ok = true;
+            char code[RELAY_CODE_LEN + 1] = "";
+            relay_code(code, sizeof(code));
+            printf("Sayri device sharing on port %d, "
+                   "pairing code %s\n",
+                   RELAY_PORT, code);
+        } else {
+            printf("Sayri device sharing unavailable\n");
+        }
+    }
+
+    SDL_Texture *rt = NULL;
+    int rt_w = 0;
+    int rt_h = 0;
+
+    bool running = true;
+    Uint64 perf_freq =
+        SDL_GetPerformanceFrequency();
+    Uint64 start =
+        SDL_GetPerformanceCounter();
+    float prev_time =
+        (float)((double)start / (double)perf_freq);
+
+    float orb_grow = 0.0f;
+    float orb_dt = 0.0f;
+    int frame_count = 0;
+
+    while (running) {
+
+        int width, height;
+        SDL_GetWindowSize(
+            window, &width, &height);
+
+        ui_begin(&ui, width, height);
+
+        relay_poll();
+
+        /*
+            Window resized across a scale step:
+            re-rasterize every font at the new
+            effective size so text stays crisp
+            and proportional to the chrome.
+        */
+        if (fabsf(ui.scale - loaded_scale) >
+                0.01f) {
+
+            if (!load_fonts(&fonts,
+                            ui.scale))
+                break;
+
+            loaded_scale = ui.scale;
+
+            font = fonts.font;
+            titleFont = fonts.titleFont;
+            smallFont = fonts.smallFont;
+            boldFont = fonts.boldFont;
+            menuFont = fonts.menuFont;
+
+            ui_text_cache_clear();
+        }
+
+        SDL_Event event;
+        while (SDL_PollEvent(&event)) {
+
+            if (event.type == SDL_QUIT)
+                running = false;
+
+            if (event.type == SDL_KEYDOWN) {
+
+                if (event.key.keysym.sym ==
+                    SDLK_ESCAPE)
+                    running = false;
+
+                bool sb_focus =
+                    searchPopup.open &&
+                    searchInput.focused;
+
+                if (event.key.keysym.sym ==
+                        SDLK_BACKSPACE &&
+                    !sb_focus &&
+                    state.input_len > 0) {
+                    state.input_len--;
+                    state.input[state.input_len] = '\0';
+                }
+
+                if (sb_focus)
+                    searchbar_event(
+                        &searchInput, &event);
+
+                if (event.key.keysym.sym ==
+                        SDLK_RETURN &&
+                    !sb_focus &&
+                    state.input_len > 0 &&
+                    !state.is_thinking) {
+                    char msg[INPUT_MAX];
+                    snprintf(msg, sizeof(msg),
+                             "%s", state.input);
+                    state.input[0] = '\0';
+                    state.input_len = 0;
+                    send_user_message(
+                        &state, msg);
+                }
+            }
+
+            if (event.type == SDL_TEXTINPUT) {
+
+                if (searchPopup.open &&
+                    searchInput.focused) {
+                    searchbar_event(
+                        &searchInput, &event);
+                } else {
+                    int len = strlen(state.input);
+                    int add = strlen(event.text.text);
+                    if (len + add < INPUT_MAX - 1) {
+                        strcat(state.input,
+                               event.text.text);
+                        state.input_len =
+                            strlen(state.input);
+                    }
+                }
+            }
+
+            /*
+                Popups must see mouse events BEFORE
+                anything else reacts to them, so a
+                fresh "open" isn't dismissed by the
+                very same click.
+            */
+            popup_event(&settings, &ui, &event);
+            popup_event(&recentsPopup, &ui, &event);
+            popup_event(&searchPopup, &ui, &event);
+            downloads_event(&dlPanel, &ui, &event);
+
+            if (event.type ==
+                SDL_MOUSEBUTTONDOWN &&
+                event.button.button ==
+                SDL_BUTTON_LEFT)
+            {
+                /* Tap a chat bubble: spawn a ripple. */
+                {
+                    SDL_Rect chatRect =
+                        chat_area_rect(
+                            &ui, &sidebar,
+                            width, height);
+
+                    ChatGeo cg = chat_geo(
+                        &ui, chatRect.x,
+                        chatRect.y,
+                        chatRect.w, chatRect.h);
+
+                    int mi = chat_bubble_at(
+                        font, &cg, &state,
+                        event.button.x,
+                        event.button.y);
+
+                    if (mi >= 0)
+                        spawn_bubble_ripple(
+                            event.button.x,
+                            event.button.y, mi);
+                }
+
+                /* Pairing controls in the sidebar. */
+                if (g_relay_ok && sidebar.anim >= 0.85f) {
+                    SDL_Rect row = pair_row_rect(&ui);
+                    if (ui_point_in_rect(event.button.x,
+                                         event.button.y, row)) {
+                        g_pair_box = !g_pair_box;
+                    } else if (g_pair_box) {
+                        /* Clicking elsewhere in the sidebar keeps it open. */
+                    }
+                }
+
+                int item =
+                    sidebar_item_at(
+                        &sidebar, &ui,
+                        event.button.x,
+                        event.button.y);
+
+                if (item >= 0) {
+                    switch (item) {
+                    case 0:
+                        /*
+                            New Chat: save current
+                            session, start fresh.
+                        */
+                        persist_session(&state);
+                        state.count = 0;
+                        clear_bubble_ripples();
+                        state.cur_session[0] =
+                            '\0';
+                        state.input[0] = '\0';
+                        state.input_len = 0;
+                        add_message(&state,
+                            "Hi, I'm Sayri. "
+                            "How can I help?",
+                            false);
+                        break;
+
+                    case 1: {
+                        /*
+                            Recents.
+                        */
+                        settings.open = false;
+                        searchPopup.open = false;
+
+                        g_history.count = 0;
+                        history_list(&g_history);
+
+                        if (g_history.count >
+                            POPUP_MAX_ITEMS)
+                            g_history.count =
+                                POPUP_MAX_ITEMS;
+
+                        if (g_history.count == 0)
+                            snprintf(
+                                g_item_labels[0],
+                                sizeof(g_item_labels[0]),
+                                "(no saved chats)");
+
+                        for (int k = 0;
+                             k < g_history.count;
+                             k++) {
+
+                            long t = atol(
+                                g_history.names[k]);
+
+                            struct tm *tm =
+                                localtime(&t);
+
+                            strftime(
+                                g_item_labels[k],
+                                sizeof(g_item_labels[0]),
+                                "%b %d %H:%M", tm);
+                        }
+
+                        const char *labels[
+                            POPUP_MAX_ITEMS];
+
+                        int label_count =
+                            g_history.count;
+
+                        if (label_count == 0)
+                            label_count = 1;
+
+                        for (int k = 0;
+                             k < label_count;
+                             k++)
+                            labels[k] =
+                                g_item_labels[k];
+
+                        popup_set_items(
+                            &recentsPopup,
+                            labels,
+                            label_count);
+
+                        recentsPopup.open = true;
+                        break;
+                    }
+
+                    case 2: {
+                        /*
+                            Search saved chats.
+                        */
+                        if (searchPopup.clicked_outside)
+                            break;
+
+                        settings.open = false;
+                        recentsPopup.open =
+                            false;
+
+                        popup_toggle(
+                            &searchPopup);
+
+                        if (searchPopup.open) {
+
+                            searchInput.text[0] =
+                                '\0';
+                            searchInput.len = 0;
+                            searchInput.focused =
+                                true;
+
+                            g_last_query[0] = '\0';
+
+                            /*
+                                First fill happens on
+                                the query-diff check, but
+                                do it now so the panel
+                                isn't blank for a frame.
+                            */
+                            rebuild_search_results();
+                            snprintf(g_last_query,
+                                     sizeof(g_last_query),
+                                     "%s",
+                                     searchInput.text);
+                        }
+
+                        sidebar.open = false;
+                        break;
+                    }
+
+                    case 3: {
+                        /*
+                            Downloads panel.
+                        */
+                        if (settings.clicked_outside ||
+                            recentsPopup.clicked_outside ||
+                            searchPopup.clicked_outside)
+                            break;
+
+                        settings.open = false;
+                        recentsPopup.open = false;
+                        searchPopup.open = false;
+
+                        bool was_open =
+                            dlPanel.open;
+
+                        dlPanel.open = !was_open;
+
+                        if (dlPanel.open &&
+                            !dlPanel.pulling) {
+
+                            /*
+                                Refresh installed
+                                state from the server.
+                            */
+                            char models_check[
+                                MAX_MODELS][128];
+
+                            int n =
+                                ollama_fetch_models(
+                                    models_check,
+                                    MAX_MODELS);
+
+                            g_server_ok =
+                                (n >= 0);
+
+                            bool found = false;
+
+                            size_t ml =
+                                strlen(dlPanel.model);
+
+                            for (int k = 0; k < n;
+                                 k++) {
+
+                                if (!strncmp(
+                                        models_check[k],
+                                        dlPanel.model,
+                                        ml) &&
+                                    (models_check[k][ml]
+                                        == ':' ||
+                                     models_check[k][ml]
+                                        == '\0')) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+
+                            if (g_server_ok)
+                                downloads_set_installed(
+                                    &dlPanel, found);
+                        }
+
+                        sidebar.open = false;
+                        break;
+                    }
+
+                    case 4:
+                        /*
+                            If this same click just
+                            dismissed the popup, don't
+                            reopen it.
+                        */
+                        if (!settings.clicked_outside) {
+                            popup_toggle(&settings);
+
+                            if (settings.open) {
+                                recentsPopup.open =
+                                    false;
+                                searchPopup.open =
+                                    false;
+
+                                g_model_count =
+                                    ollama_fetch_models(
+                                        g_models,
+                                        MAX_MODELS);
+
+                                /*
+                                    Rebuild the
+                                    dropdown from the
+                                    live model list and
+                                    point it at the
+                                    active model.
+                                */
+                                int n =
+                                    g_model_count >
+                                    0
+                                        ? g_model_count
+                                        : 0;
+
+                                if (n >
+                                    DROPDOWN_MAX_ITEMS)
+                                    n =
+                                        DROPDOWN_MAX_ITEMS;
+
+                                modelDropdown.itemCount =
+                                    0;
+
+                                for (int k = 0;
+                                     k < n;
+                                     k++)
+
+                                    dropdown_add_item(
+                                        &modelDropdown,
+                                        g_models[k]);
+
+                                modelDropdown.selected =
+                                    n > 0
+                                        ? g_model_idx
+                                        : -1;
+                            }
+                        }
+
+                        sidebar.open = false;
+                        break;
+                    }
+
+                }
+
+                int ibH =
+                    (int)roundf(42.0f * ui.scale);
+                int pad2 =
+                    (int)roundf(14.0f * ui.scale);
+                int sbW =
+                    (int)roundf(
+                        240.0f * ui.scale *
+                        sidebar.anim);
+                int sendSize = ibH;
+                SDL_Rect sendBtn = {
+                    width - pad2 - sendSize,
+                    height - pad2 - ibH,
+                    sendSize,
+                    sendSize};
+
+                /*
+                    Send button.
+                */
+                if (ui_point_in_rect(
+                        event.button.x,
+                        event.button.y,
+                        sendBtn)) {
+
+                    if (state.input_len > 0 &&
+                        !state.is_thinking) {
+                        char msg[INPUT_MAX];
+                        snprintf(msg, sizeof(msg),
+                                 "%s",
+                                 state.input);
+                        state.input[0] = '\0';
+                        state.input_len = 0;
+                        state.input_focused =
+                            true;
+                        send_user_message(
+                            &state, msg);
+                    }
+                }
+
+                SDL_Rect ib = {
+                    sbW + pad2,
+                    height - pad2 - ibH,
+                    width - sbW - pad2 * 2 -
+                        (int)roundf(42.0f * ui.scale),
+                    ibH};
+
+                state.input_focused =
+                    ui_point_in_rect(
+                        event.button.x,
+                        event.button.y, ib);
+            }
+
+            if (event.type == SDL_MOUSEWHEEL) {
+                state.target_scroll +=
+                    event.wheel.y * 30.0f;
+                if (state.target_scroll > 0)
+                    state.target_scroll = 0;
+            }
+
+            hamburger_event(&hamburger, &event);
+            sidebar_event(&sidebar, &event);
+        }
+
+        /*
+            Theme follows the settings toggle.
+        */
+        ui.dark = darkToggle.on;
+
+        /*
+            Consume popup clicks.
+        */
+        int picked =
+            popup_consume_item_click(
+                &recentsPopup);
+
+        if (picked >= 0 &&
+            picked < g_history.count) {
+
+            load_session_file(
+                &state,
+                g_history.names[picked]);
+
+            recentsPopup.open = false;
+        }
+
+        /*
+            Search popup: live-filter while the
+            query changes; load a clicked row.
+        */
+        if (searchPopup.open) {
+
+            if (strcmp(g_last_query,
+                       searchInput.text) != 0) {
+
+                snprintf(g_last_query,
+                         sizeof(g_last_query),
+                         "%s", searchInput.text);
+
+                rebuild_search_results();
+            }
+
+            int spicked =
+                popup_consume_item_click(
+                    &searchPopup);
+
+            if (spicked >= 0 &&
+                spicked < POPUP_MAX_ITEMS &&
+                g_search_files[spicked][0]) {
+
+                load_session_file(
+                    &state,
+                    g_search_files[spicked]);
+
+                searchPopup.open = false;
+            }
+        }
+
+        /*
+            Settings dropdown: apply a newly
+            picked model.
+        */
+        if (settings.open &&
+            modelDropdown.selected >= 0 &&
+            g_model_count > 0 &&
+            modelDropdown.selected <
+                g_model_count &&
+            modelDropdown.selected !=
+                g_model_idx) {
+
+            g_model_idx =
+                modelDropdown.selected;
+
+            snprintf(g_current_model,
+                     sizeof(g_current_model),
+                     "%s",
+                     g_models[g_model_idx]);
+
+            ollama_set_model(g_current_model);
+        }
+
+        /*
+            Downloads panel: feed progress and
+            start pulls / full setup.
+        */
+        OllamaPull pull;
+
+        ollama_poll_pull(&pull);
+
+        downloads_set_pull(&dlPanel, &pull);
+
+        OllamaSetup setup;
+
+        ollama_poll_setup(&setup);
+
+        downloads_set_setup(&dlPanel, &setup,
+                            !g_server_ok);
+
+        if (setup.done && setup.ok) {
+
+            /*
+                Bootstrap finished: refresh the
+                model list so Settings can pick
+                immediately.
+            */
+            g_model_count =
+                ollama_fetch_models(
+                    g_models, MAX_MODELS);
+
+            g_server_ok =
+                (g_model_count >= 0);
+
+            g_model_idx = 0;
+
+            for (int k = 0; k < g_model_count;
+                 k++) {
+
+                if (!strcmp(g_models[k],
+                            g_current_model)) {
+                    g_model_idx = k;
+                    break;
+                }
+            }
+
+            modelDropdown.selected =
+                g_model_count > 0
+                    ? g_model_idx
+                    : -1;
+
+            /*
+                A chat turn failed while the
+                service was down: replay it now.
+            */
+            if (g_retry_pending) {
+
+                g_retry_pending = false;
+                g_autoheal_attempts = 0;
+
+                if (!dispatch_chat(&state)) {
+                    add_message(&state,
+                        "(Ready \u2014 tap send "
+                        "to retry.)", false);
+                }
+            }
+        }
+
+        if (downloads_consume_install_click(
+                &dlPanel)) {
+
+            bool busy =
+                dlPanel.pulling ||
+                dlPanel.setting_up;
+
+            if (!busy) {
+
+                if (!g_server_ok) {
+                    g_server_ok = true; /*
+                        optimistic; setup
+                        re-checks */
+                    dlPanel.failed = false;
+                    dlPanel.note[0] = '\0';
+                    ollama_setup_begin(
+                        dlPanel.model);
+                } else {
+                    ollama_pull_begin(
+                        dlPanel.model);
+                }
+            }
+        }
+
+        if (hamburger.clicked) {
+            hamburger.clicked = false; /*
+                latch: stays set until the next
+                mouse-up, so consume it or the
+                toggle fires every frame */
+            sidebar.open = !sidebar.open;
+        }
+
+        hamburger.open = sidebar.open;
+
+        Uint64 now =
+            SDL_GetPerformanceCounter();
+
+        float time =
+            (float)((double)(now - start) /
+                    (double)perf_freq);
+
+        float dt = time - prev_time;
+        prev_time = time;
+        if (dt > 0.05f) dt = 0.05f;
+
+        state.scroll_offset +=
+            (state.target_scroll -
+             state.scroll_offset) * 8.0f * dt;
+
+        for (int i = 0; i < state.count; i++) {
+            ChatMessage *m = &state.messages[i];
+            m->alpha += (1.0f - m->alpha) * 6.0f * dt;
+            m->slide_y +=
+                (0.0f - m->slide_y) * 8.0f * dt;
+        }
+
+        /*
+            IPC clients: accept one message at a
+            time and route it through the normal
+            chat so it shows in the window too.
+        */
+        {
+            char ipc_msg[IPC_MAX_MSG];
+            int ipc_fd = ipc_recv(ipc_msg,
+                                  sizeof(ipc_msg));
+
+            if (ipc_fd >= 0) {
+                if (g_ipc_fd >= 0) {
+                    /* Busy: another IPC turn pending. */
+                    ipc_reply(ipc_fd,
+                        "(Sayri is busy - try again "
+                        "in a moment.)");
+                } else if (!state.is_thinking &&
+                           !g_retry_pending) {
+                    g_ipc_fd = ipc_fd;
+                    send_user_message(&state,
+                                      ipc_msg);
+                } else {
+                    ipc_reply(ipc_fd,
+                        "(Sayri is busy - try again "
+                        "in a moment.)");
+                }
+            }
+        }
+
+        /*
+            Ollama reply?
+        */
+        OllamaReply reply;
+        ollama_poll(&reply);
+
+        if (reply.done) {
+
+            state.is_thinking = false;
+
+            /*
+                Server unreachable: heal by
+                itself and replay the turn once
+                the bootstrap lands. Capped so a
+                genuinely broken install cannot
+                loop forever.
+            */
+            if (!reply.ok &&
+                reply.server_down &&
+                !g_retry_pending &&
+                g_autoheal_attempts < 2) {
+
+                g_autoheal_attempts++;
+                g_retry_pending = true;
+
+                if (!dlPanel.setting_up)
+                    ollama_setup_begin(
+                        g_current_model);
+
+                add_message(&state,
+                    "(Starting the local AI "
+                    "service\u2026)", false);
+
+            } else {
+
+                if (reply.ok)
+                    g_autoheal_attempts = 0;
+
+                add_message(
+                    &state, reply.text, false);
+
+                /*
+                    A terminal reply resolves any
+                    pending IPC turn.
+                */
+                deliver_ipc_reply(reply.text);
+            }
+        }
+
+        /*
+            ------------------------------------------------
+            RENDER (glass at 2x, text at 1x)
+            ------------------------------------------------
+        */
+
+        if (width != rt_w || height != rt_h) {
+
+            if (rt)
+                SDL_DestroyTexture(rt);
+
+            rt_w = width;
+            rt_h = height;
+
+            /*
+                Linear filtering for the downscale
+                (2x glass -> 1x screen).
+            */
+            SDL_SetHint(
+                SDL_HINT_RENDER_SCALE_QUALITY, "1");
+
+            rt =
+                SDL_CreateTexture(
+                    renderer,
+                    SDL_PIXELFORMAT_ARGB8888,
+                    SDL_TEXTUREACCESS_TARGET,
+                    width * 2,
+                    height * 2);
+
+            SDL_SetTextureBlendMode(
+                rt, SDL_BLENDMODE_BLEND);
+
+            SDL_SetHint(
+                SDL_HINT_RENDER_SCALE_QUALITY, "0");
+        }
+
+        /*
+            Pass 1: background + glass at 2x.
+        */
+
+        SDL_SetRenderTarget(renderer, rt);
+        SDL_RenderSetScale(renderer, 2.0f, 2.0f);
+
+        draw_background(
+            renderer, &ui, width, height, time);
+
+        /*
+            Pass 2: downscale glass.
+        */
+
+        SDL_SetRenderTarget(renderer, NULL);
+        SDL_RenderSetScale(
+            renderer, 1.0f, 1.0f);
+
+        SDL_Rect dst = {0, 0, width, height};
+        SDL_RenderCopy(
+            renderer, rt, NULL, &dst);
+
+        /*
+            Pass 3: widgets + text at 1x native.
+        */
+
+        ui_text_cache_clear();
+
+        /*
+            Layout.
+        */
+        int pad =
+            (int)roundf(14.0f * ui.scale);
+        int inputBarH =
+            (int)roundf(42.0f * ui.scale);
+        int sendBtnSize = inputBarH;
+        int sbPx =
+            (int)(ui_ease_out_cubic(sidebar.anim) *
+            260.0f * ui.scale);
+
+        SDL_Rect chatRect =
+            chat_area_rect(
+                &ui, &sidebar, width, height);
+
+        /*
+            Sidebar.
+        */
+        sidebar_layout(
+            &sidebar, &ui,
+            0, 0, 240, height / ui.scale);
+
+        sidebar_draw(
+            &sidebar, &ui, renderer,
+            boldFont, menuFont, dt);
+
+        /*
+            Pairing button + code in the sidebar.
+        */
+        draw_pair_controls(
+            renderer, &ui, menuFont,
+            sidebar.anim);
+
+        /*
+            Hamburger button.
+        */
+        hamburger_layout(
+            &hamburger, &ui,
+            15, 15, 40);
+
+        hamburger_draw(
+            &hamburger, &ui, renderer);
+
+        /*
+            Chat area.
+        */
+        draw_chat_area(
+            renderer, &state, &ui, font,
+            chatRect.x, chatRect.y,
+            chatRect.w, chatRect.h);
+
+        /*
+            Orb (Sayri avatar).
+
+            Drawn after the chat panel so it
+            overlaps on top of the glass.
+        */
+        orb_grow +=
+            ((state.is_thinking ? 1.0f : 0.0f) -
+             orb_grow) * 5.0f * dt;
+
+        int chatW =
+            width - sbPx - pad * 2;
+
+        float orbSizeF =
+            (float)chatW * 0.24f *
+            (1.0f + 0.10f * orb_grow);
+
+        if (orbSizeF > height * 0.30f)
+            orbSizeF = height * 0.30f;
+
+        /*
+            Hard cap: never upscale the 256px
+            orb texture much beyond 1:1, or it
+            turns to mush on big screens.
+        */
+        if (orbSizeF > 240.0f)
+            orbSizeF = 240.0f;
+
+        SDL_Rect orbRect = {
+            sbPx + pad +
+                (chatW - (int)orbSizeF) / 2,
+            chatRect.y + pad,
+            (int)orbSizeF,
+            (int)orbSizeF
+        };
+
+        /*
+            Re-render at half rate: the 256x256
+            CPU shader is 4x the cost of the old
+            128x128 one. Time still advances by
+            the full dt.
+        */
+        orb_dt += dt;
+        frame_count++;
+
+        if ((frame_count & 1) == 0) {
+            orb_update(&orb, orb_dt);
+            orb_dt = 0.0f;
+        }
+
+        orb_draw(
+            &orb, renderer, orbRect);
+
+        /*
+            Input bar.
+        */
+        draw_input_bar(
+            renderer, &state, &ui, font,
+            sbPx + pad,
+            height - pad - inputBarH,
+            width - sbPx - pad * 2 - sendBtnSize - 8,
+            inputBarH, time);
+
+        /*
+            Send button.
+        */
+        draw_send_button(
+            renderer, &state, &ui, font,
+            width - pad - sendBtnSize,
+            height - pad - inputBarH,
+            sendBtnSize);
+
+        /*
+            Settings popover (topmost).
+        */
+        popup_layout(
+            &settings, &ui,
+            (float)width / ui.scale -
+                POPUP_DEFAULT_W - 14.0f,
+            64.0f,
+            POPUP_DEFAULT_W,
+            POPUP_H_DROPDOWN);
+
+        popup_draw(
+            &settings, &ui, renderer,
+            font, boldFont, dt);
+
+        /*
+            Recents popover.
+        */
+        popup_layout(
+            &recentsPopup, &ui,
+            70.0f,
+            64.0f,
+            POPUP_DEFAULT_W,
+            recentsPopup.item_count
+                ? POPUP_HEIGHT_FOR(
+                      recentsPopup.item_count)
+                : POPUP_DEFAULT_H);
+
+        popup_draw(
+            &recentsPopup, &ui, renderer,
+            font, boldFont, dt);
+
+        /*
+            Search popover.
+        */
+        popup_layout(
+            &searchPopup, &ui,
+            70.0f,
+            64.0f,
+            POPUP_DEFAULT_W,
+            POPUP_HEIGHT_FOR_SEARCH(
+                searchPopup.item_count
+                    ? searchPopup.item_count
+                    : 1));
+
+        popup_draw(
+            &searchPopup, &ui, renderer,
+            font, boldFont, dt);
+
+        /*
+            Downloads panel (topmost).
+        */
+        downloads_layout(
+            &dlPanel, &ui,
+            (float)width / ui.scale -
+                DL_DEFAULT_W - 14.0f,
+            64.0f,
+            DL_DEFAULT_W,
+            DL_DEFAULT_H);
+
+        downloads_draw(
+            &dlPanel, &ui, renderer,
+            font, boldFont, dt);
+
+        SDL_RenderPresent(renderer);
+    }
+
+    /*
+        Persist the current conversation on quit.
+    */
+    persist_session(&state);
+
+    if (rt)
+        SDL_DestroyTexture(rt);
+
+    deliver_ipc_reply("(Sayri closed.)");
+    ipc_stop();
+    relay_stop();
+    orb_free(&orb);
+    ollama_shutdown();
+
+    close_fonts(&fonts);
+
+    ripple_free_storage();
+
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+
+    TTF_Quit();
+    SDL_Quit();
+
+    return 0;
+}

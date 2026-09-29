@@ -23,6 +23,7 @@
 #include "toggle.h"
 #include "popup.h"
 #include "downloads.h"
+#include "ripple.h"
 #include "ollama.h"
 #include "history.h"
 #include "ipc.h"
@@ -60,6 +61,12 @@ static UISearchBar searchInput;
 static char g_search_labels[POPUP_MAX_ITEMS][72];
 static char g_search_files[POPUP_MAX_ITEMS][64];
 static char g_last_query[SEARCHBAR_MAX];
+
+/*
+    Latest orb placement (pixel space), recorded each
+    frame so the click handler can hit-test it.
+*/
+static SDL_Rect g_orb_rect;
 
 /*
     False once /api proves unreachable —
@@ -328,6 +335,7 @@ static void load_session_file(
 
     st->count = 0;
     st->cur_session[0] = '\0';
+    ripple_clear();
 
     for (int i = 0; i < n; i++)
         add_message(st,
@@ -830,6 +838,168 @@ static int wrap_lines(
     return count + 1;
 }
 
+/* ============================================================
+   Chat bubble geometry (shared by rendering + hit-testing)
+   ============================================================ */
+
+typedef struct {
+    int x, y, w, h;
+    int pad;
+    int msgH;
+    int msgGap;
+    int maxBubbleW;
+    int textPad;
+    int linePad;
+    int padV;
+} ChatGeo;
+
+static ChatGeo chat_geo(
+    UIContext *ui,
+    int x, int y, int w, int h)
+{
+    ChatGeo g;
+    g.x = x;
+    g.y = y;
+    g.w = w;
+    g.h = h;
+    g.pad = (int)roundf(14.0f * ui->scale);
+    g.msgH = (int)roundf(38.0f * ui->scale);
+    g.msgGap = (int)roundf(6.0f * ui->scale);
+    g.maxBubbleW = w - g.pad * 2 -
+        (int)roundf(40.0f * ui->scale);
+    g.textPad = (int)roundf(12.0f * ui->scale);
+    g.linePad = (int)roundf(3.0f * ui->scale);
+    g.padV = (int)roundf(9.0f * ui->scale);
+    return g;
+}
+
+static void chat_bubble_metrics(
+    TTF_Font *font,
+    const ChatGeo *g,
+    const ChatMessage *m,
+    int *out_w,
+    int *out_h)
+{
+    int bubbleW =
+        m->is_user
+        ? (int)(g->maxBubbleW * 0.60f)
+        : (int)(g->maxBubbleW * 0.75f);
+
+    if (bubbleW < 60) bubbleW = 60;
+
+    char lines[CHAT_WRAP_LINES][CHAT_LINE_CAP];
+
+    int lineCount =
+        wrap_lines(
+            font, m->text,
+            bubbleW - g->textPad * 2,
+            lines, CHAT_WRAP_LINES);
+
+    int fontH = TTF_FontHeight(font);
+
+    int bubbleH =
+        lineCount * (fontH + g->linePad) +
+        g->padV * 2;
+
+    if (bubbleH < g->msgH)
+        bubbleH = g->msgH;
+
+    if (out_w) *out_w = bubbleW;
+    if (out_h) *out_h = bubbleH;
+}
+
+static SDL_Rect chat_bubble_rect(
+    TTF_Font *font,
+    const ChatGeo *g,
+    const AppState *state,
+    int i)
+{
+    const ChatMessage *m = &state->messages[i];
+
+    int bubbleW, bubbleH;
+    chat_bubble_metrics(font, g, m, &bubbleW, &bubbleH);
+
+    int bubbleX =
+        m->is_user
+        ? g->x + g->w - g->pad - bubbleW
+        : g->x + g->pad;
+
+    int curY =
+        g->y + g->h - g->pad +
+        (int)state->scroll_offset;
+
+    for (int k = state->count - 1; k >= i; k--) {
+        const ChatMessage *mk = &state->messages[k];
+
+        int wk, hk;
+        chat_bubble_metrics(font, g, mk, &wk, &hk);
+
+        curY -= hk + g->msgGap;
+
+        if (k == i) {
+            int bubbleY =
+                curY +
+                (int)(m->slide_y * (1.0f - m->alpha));
+
+            return (SDL_Rect){
+                bubbleX, bubbleY,
+                bubbleW, bubbleH};
+        }
+    }
+
+    return (SDL_Rect){0, 0, 0, 0};
+}
+
+/*
+    Chat panel rectangle for the current window
+    layout.
+*/
+static SDL_Rect chat_area_rect(
+    UIContext *ui,
+    const UISidebar *sb,
+    int width, int height)
+{
+    int pad = (int)roundf(14.0f * ui->scale);
+    int inputBarH = (int)roundf(42.0f * ui->scale);
+    int sbPx = (int)(
+        ui_ease_out_cubic(sb->anim) *
+        260.0f * ui->scale);
+
+    int chatTop = pad;
+    int chatBottom = height - pad - inputBarH - pad;
+
+    int chatH = chatBottom - chatTop;
+    if (chatH < 80) chatH = 80;
+
+    return (SDL_Rect){
+        sbPx + pad, chatTop,
+        width - sbPx - pad * 2, chatH};
+}
+
+/*
+    First visible message whose bubble contains
+    the given point.
+*/
+static int chat_bubble_at(
+    TTF_Font *font,
+    const ChatGeo *g,
+    const AppState *state,
+    int mx, int my)
+{
+    for (int i = state->count - 1; i >= 0; i--) {
+        const ChatMessage *m = &state->messages[i];
+        if (m->alpha < 0.01f) continue;
+
+        SDL_Rect b =
+            chat_bubble_rect(font, g, state, i);
+
+        if (ui_point_in_rect(mx, my, b))
+            return i;
+    }
+
+    return -1;
+}
+
 static void draw_chat_area(
     SDL_Renderer *renderer,
     AppState *state,
@@ -848,76 +1018,18 @@ static void draw_chat_area(
 
     SDL_RenderSetClipRect(renderer, &container);
 
-    int pad =
-        (int)roundf(14.0f * ui->scale);
-
-    int msgH =
-        (int)roundf(38.0f * ui->scale);
-
-    int msgGap =
-        (int)roundf(6.0f * ui->scale);
-
-    int curY =
-        y + h - pad +
-        (int)state->scroll_offset;
+    ChatGeo geo = chat_geo(ui, x, y, w, h);
 
     for (int i = state->count - 1; i >= 0; i--) {
 
         ChatMessage *m = &state->messages[i];
         if (m->alpha < 0.01f) continue;
 
-        int maxBubbleW = w - pad * 2 -
-            (int)roundf(40.0f * ui->scale);
-
-        int bubbleW =
-            m->is_user
-            ? (int)(maxBubbleW * 0.60f)
-            : (int)(maxBubbleW * 0.75f);
-
-        if (bubbleW < 60) bubbleW = 60;
-
-        int textPad =
-            (int)roundf(12.0f * ui->scale);
-
-        int bubbleX =
-            m->is_user
-            ? x + w - pad - bubbleW
-            : x + pad;
-
-        /*
-            Wrap into lines that fit the bubble.
-        */
-        char lines[CHAT_WRAP_LINES][CHAT_LINE_CAP];
-
-        int lineCount =
-            wrap_lines(
-                font, m->text,
-                bubbleW - textPad * 2,
-                lines, CHAT_WRAP_LINES);
-
-        int fontH = TTF_FontHeight(font);
-
-        int lineH = fontH +
-            (int)roundf(3.0f * ui->scale);
-
-        int padV =
-            (int)roundf(9.0f * ui->scale);
-
-        int bubbleH =
-            lineCount * lineH + padV * 2;
-
-        if (bubbleH < msgH)
-            bubbleH = msgH;
-
-        curY -= bubbleH + msgGap;
-        int bubbleY =
-            curY + (int)(m->slide_y * (1.0f - m->alpha));
+        SDL_Rect bubble =
+            chat_bubble_rect(font, &geo, state, i);
 
         Uint8 bgA =
             (Uint8)(180.0f * m->alpha);
-
-        SDL_Rect bubble = {
-            bubbleX, bubbleY, bubbleW, bubbleH};
 
         if (m->is_user) {
             ui_fill_rounded_rect(
@@ -935,11 +1047,25 @@ static void draw_chat_area(
                 : (UIColor){230, 235, 248, bgA});
         }
 
+        /*
+            Wrap into lines that fit the bubble.
+        */
+        char lines[CHAT_WRAP_LINES][CHAT_LINE_CAP];
+
+        int lineCount =
+            wrap_lines(
+                font, m->text,
+                bubble.w - geo.textPad * 2,
+                lines, CHAT_WRAP_LINES);
+
+        int fontH = TTF_FontHeight(font);
+        int lineH = fontH + geo.linePad;
+
         Uint8 tA =
             (Uint8)(230.0f * m->alpha);
 
-        int textY = bubbleY +
-            (bubbleH - lineCount * lineH) / 2;
+        int textY = bubble.y +
+            (bubble.h - lineCount * lineH) / 2;
 
         UIColor textColor =
             m->is_user
@@ -953,10 +1079,18 @@ static void draw_chat_area(
         for (int k = 0; k < lineCount; k++) {
             ui_text(
                 renderer, font, lines[k],
-                bubbleX + textPad,
+                bubble.x + geo.textPad,
                 textY + k * lineH,
                 textColor);
         }
+
+        /*
+            Ripple overlay for taps on this bubble.
+        */
+        ripple_draw(
+            renderer, bubble, i);
+
+        SDL_RenderSetClipRect(renderer, &container);
     }
 
     SDL_RenderSetClipRect(renderer, NULL);
@@ -1187,7 +1321,7 @@ int main(void)
             "Sayri",
             SDL_WINDOWPOS_CENTERED,
             SDL_WINDOWPOS_CENTERED,
-            520, 720,
+            1280, 720,
             SDL_WINDOW_SHOWN |
             SDL_WINDOW_RESIZABLE);
 
@@ -1532,6 +1666,64 @@ int main(void)
                 event.button.button ==
                 SDL_BUTTON_LEFT)
             {
+                /*
+                    Tap the orb: ripple the avatar
+                    itself. Wins over the bubble
+                    ripple — the orb overlaps the
+                    chat glass.
+                */
+                if (ui_point_in_rect(
+                        event.button.x,
+                        event.button.y,
+                        g_orb_rect) &&
+                    g_orb_rect.w > 0)
+                {
+                    float tex_x =
+                        (float)(event.button.x -
+                            g_orb_rect.x) /
+                        (float)g_orb_rect.w *
+                        ORB_RES;
+                    float tex_y =
+                        (float)(event.button.y -
+                            g_orb_rect.y) /
+                        (float)g_orb_rect.h *
+                        ORB_RES;
+
+                    orb_tap(&orb, tex_x, tex_y);
+                }
+                else
+                {
+                    /* Tap a chat bubble: spawn a ripple. */
+                    SDL_Rect chatRect =
+                        chat_area_rect(
+                            &ui, &sidebar,
+                            width, height);
+
+                    ChatGeo cg = chat_geo(
+                        &ui, chatRect.x,
+                        chatRect.y,
+                        chatRect.w, chatRect.h);
+
+                    int mi = chat_bubble_at(
+                        font, &cg, &state,
+                        event.button.x,
+                        event.button.y);
+
+                    if (mi >= 0) {
+                        SDL_Rect bubble =
+                            chat_bubble_rect(
+                                font, &cg, &state, mi);
+
+                        ripple_tap(
+                            bubble,
+                            (float)roundf(
+                                14.0f * ui.scale),
+                            mi,
+                            event.button.x,
+                            event.button.y);
+                    }
+                }
+
                 /* Pairing controls in the sidebar. */
                 if (g_relay_ok && sidebar.anim >= 0.85f) {
                     SDL_Rect row = pair_row_rect(&ui);
@@ -1558,6 +1750,7 @@ int main(void)
                         */
                         persist_session(&state);
                         state.count = 0;
+                        ripple_clear();
                         state.cur_session[0] =
                             '\0';
                         state.input[0] = '\0';
@@ -2208,17 +2401,13 @@ int main(void)
         int inputBarH =
             (int)roundf(42.0f * ui.scale);
         int sendBtnSize = inputBarH;
-        float sbWF =
-            ui_ease_out_cubic(sidebar.anim) *
-            260.0f;
         int sbPx =
-            (int)(sbWF * ui.scale);
+            (int)(ui_ease_out_cubic(sidebar.anim) *
+            260.0f * ui.scale);
 
-        int chatTop = pad;
-        int chatBottom =
-            height - pad - inputBarH - pad;
-        int chatH = chatBottom - chatTop;
-        if (chatH < 80) chatH = 80;
+        SDL_Rect chatRect =
+            chat_area_rect(
+                &ui, &sidebar, width, height);
 
         /*
             Sidebar.
@@ -2253,8 +2442,8 @@ int main(void)
         */
         draw_chat_area(
             renderer, &state, &ui, font,
-            sbPx + pad, chatTop,
-            width - sbPx - pad * 2, chatH);
+            chatRect.x, chatRect.y,
+            chatRect.w, chatRect.h);
 
         /*
             Orb (Sayri avatar).
@@ -2287,10 +2476,13 @@ int main(void)
         SDL_Rect orbRect = {
             sbPx + pad +
                 (chatW - (int)orbSizeF) / 2,
-            chatTop + pad,
+            chatRect.y + pad,
             (int)orbSizeF,
             (int)orbSizeF
         };
+
+        /* Latest orb placement for the click handler. */
+        g_orb_rect = orbRect;
 
         /*
             Re-render at half rate: the 256x256
@@ -2410,6 +2602,8 @@ int main(void)
     ollama_shutdown();
 
     close_fonts(&fonts);
+
+    ripple_free();
 
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);

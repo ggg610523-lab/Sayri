@@ -1,5 +1,6 @@
 #include "orb.h"
 #include "orb1.h"
+#include "ripple.h"
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
@@ -565,6 +566,70 @@ static void orb_gl_render(Orb *orb)
 
 static int g_gl_up = 0;
 
+/*
+    Pristine orb pixels (refreshed every orb_update)
+    that the tap ripple warps from — never the previous
+    frame's warped output.
+*/
+static Uint32 *g_orb_snap = NULL;
+
+void orb_tap(
+    Orb *orb,
+    float tex_x,
+    float tex_y)
+{
+    orb->tap_active = true;
+    orb->tap_ox = tex_x;
+    orb->tap_oy = tex_y;
+    orb->tap_start = SDL_GetTicks64();
+
+    if (!g_orb_snap) {
+        g_orb_snap = (Uint32 *)malloc(
+            sizeof(Uint32) *
+            ORB_RES * ORB_RES);
+    }
+}
+
+/*
+    Warp the freshly-rendered orb pixels for the active
+    tap ripple. Runs inside orb_draw's GL path only.
+*/
+static void orb_warp_tap(Orb *orb)
+{
+    if (!orb->tap_active)
+        return;
+
+    if (!g_orb_snap)
+        return;
+
+    Uint64 now = SDL_GetTicks64();
+    float t = (float)(
+        (double)(now - orb->tap_start) / 1000.0);
+
+    if (t >= RIPPLE_DURATION) {
+        orb->tap_active = false;
+        return;
+    }
+
+    if (t <= 0.0f)
+        return;
+
+    const float amp = 28.0f;
+
+    for (int y = 0; y < ORB_RES; y++) {
+        for (int x = 0; x < ORB_RES; x++) {
+            orb->pixels[y * ORB_RES + x] =
+                ripple_warp_tex(
+                    g_orb_snap, ORB_RES, ORB_RES,
+                    (float)x, (float)y,
+                    orb->tap_ox, orb->tap_oy,
+                    t, amp);
+        }
+    }
+
+    orb->dirty = true;
+}
+
 void orb_init(
     Orb *orb,
     SDL_Renderer *renderer)
@@ -594,6 +659,17 @@ void orb_init(
     if (orb_gl_init()) {
         g_gl_up = 1;
         orb_gl_render(orb);
+
+        if (!g_orb_snap) {
+            g_orb_snap = (Uint32 *)malloc(
+                sizeof(Uint32) *
+                ORB_RES * ORB_RES);
+        }
+        if (g_orb_snap) {
+            memcpy(g_orb_snap, orb->pixels,
+                   sizeof(Uint32) *
+                   ORB_RES * ORB_RES);
+        }
     } else {
         Orb1 *fb = (Orb1 *)malloc(sizeof(Orb1));
 
@@ -610,6 +686,9 @@ void orb_free(Orb *orb)
         orb1_free((Orb1 *)orb->fallback);
         free(orb->fallback);
         orb->fallback = NULL;
+
+        free(g_orb_snap);
+        g_orb_snap = NULL;
         return;
     }
 
@@ -642,6 +721,9 @@ void orb_free(Orb *orb)
         orb_gl_win = NULL;
     }
 
+    free(g_orb_snap);
+    g_orb_snap = NULL;
+
     if (orb->texture) {
         SDL_DestroyTexture(orb->texture);
         orb->texture = NULL;
@@ -659,6 +741,16 @@ void orb_update(Orb *orb, float dt)
 
     orb_gl_render(orb);
     orb->dirty = true;
+
+    /*
+        Refresh the pristine warp source from the
+        freshly rendered orb.
+    */
+    if (g_orb_snap) {
+        memcpy(g_orb_snap, orb->pixels,
+               sizeof(Uint32) *
+               ORB_RES * ORB_RES);
+    }
 }
 
 void orb_draw(
@@ -674,6 +766,8 @@ void orb_draw(
 
     if (!orb->texture || !orb->visible)
         return;
+
+    orb_warp_tap(orb);
 
     if (orb->dirty) {
         void *pixels;

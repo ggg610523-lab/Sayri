@@ -1,4 +1,5 @@
 #include "downloads.h"
+#include "ripple.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -202,8 +203,6 @@ void downloads_event(
     UIContext *ui,
     SDL_Event *event)
 {
-    (void)ui;
-
     dl->clicked_outside = false;
 
     if (event->type ==
@@ -235,11 +234,23 @@ void downloads_event(
             return;
         }
 
-        if (inside && dl->open &&
-            !dl->pulling && !dl->setting_up &&
-            !dl->installed)
-            button_event(&dl->install_btn,
-                         event);
+        if (inside && dl->open) {
+            /*
+                Panel ripple: warp the whole panel
+                from the tap point.
+            */
+            ripple_tap(
+                dl->rect,
+                16.0f * ui->scale,
+                RIPPLE_TAG_REGION,
+                event->button.x,
+                event->button.y);
+
+            if (!dl->pulling && !dl->setting_up &&
+                !dl->installed)
+                button_event(&dl->install_btn,
+                             event);
+        }
     }
 
     if (event->type ==
@@ -399,4 +410,11 @@ void downloads_draw(
 
     button_draw(&dl->install_btn, ui,
                 renderer, font);
+
+    /*
+        Ripple overlay: warp the freshly drawn
+        panel back over itself.
+    */
+    ripple_draw(renderer, dl->rect,
+                RIPPLE_TAG_REGION);
 }
